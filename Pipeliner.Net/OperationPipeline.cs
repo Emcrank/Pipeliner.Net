@@ -1,230 +1,446 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using System.Runtime.CompilerServices;
 
 namespace Pipeliner.Net;
 
-public class OperationPipeline<TParam, TResult>
+/// <summary>
+/// Represents a reusable pipeline of operations that can be executed synchronously or asynchronously.
+/// </summary>
+/// <typeparam name="TParam">The pipeline input type.</typeparam>
+/// <typeparam name="TResult">The pipeline result type.</typeparam>
+public sealed class OperationPipeline<TParam, TResult>
 {
-    private readonly List<IUntypedOperation> operations = [];
-    private Func<TResult?>? resultFactory;
-    private volatile bool earlyExitSpecified;
+    private static readonly ActivitySource PipelineActivitySource = new("Pipeliner.Net");
+    private static readonly Meter PipelineMeter = new("Pipeliner.Net");
+    private static readonly Counter<long> PipelineRunCounter = PipelineMeter.CreateCounter<long>("pipeliner.pipeline.runs");
+    private static readonly Counter<long> PipelineFailureCounter = PipelineMeter.CreateCounter<long>("pipeliner.pipeline.failures");
+    private static readonly Histogram<double> PipelineDurationMs = PipelineMeter.CreateHistogram<double>("pipeliner.pipeline.duration.ms");
+    private static readonly Histogram<double> PipelineOperationDurationMs = PipelineMeter.CreateHistogram<double>("pipeliner.pipeline.operation.duration.ms");
 
-    public OperationPipeline(ILogger? logger = null)
+    private readonly List<IUntypedOperation> operations = [];
+    private readonly AsyncLocal<RunContext?> currentRunContext = new();
+    private Func<TResult?>? configuredResultFactory;
+
+    private sealed class RunContext(TParam parameter, Func<TResult?>? resultFactory)
+    {
+        public TParam Parameter { get; } = parameter;
+
+        public Func<TResult?>? ResultFactory { get; set; } = resultFactory;
+    }
+
+    /// <summary>
+    /// Initializes a new instance of <see cref="OperationPipeline{TParam,TResult}"/>
+    /// </summary>
+    /// <param name="logger">The optional logger for pipeline diagnostics.</param>
+    internal OperationPipeline(ILogger? logger = null)
     {
         Logger = logger;
     }
 
-    public string Id { get; set; } = Guid.NewGuid().ToString("D");
+    /// <summary>
+    /// Gets or sets the unique pipeline identifier.
+    /// </summary>
+    public string Id { get; internal set; } = Guid.NewGuid().ToString("D");
 
-    public string Name { get; set; } = "Unnamed_Pipeline";
+    /// <summary>
+    /// Gets or sets the friendly pipeline name.
+    /// </summary>
+    public string Name { get; internal set; } = "Unnamed_Pipeline";
 
-    protected ILogger? Logger { get; }
+    /// <summary>
+    /// Gets the logger used by this pipeline.
+    /// </summary>
+    private ILogger? Logger { get; }
 
-    protected TParam? Parameter { get; private set; }
+    /// <summary>
+    /// Gets the current execution parameter for the active run.
+    /// </summary>
+    private TParam Parameter => currentRunContext.Value is { } runContext ? runContext.Parameter : default!;
 
+    /// <summary>
+    /// Executes the pipeline synchronously.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <returns>The pipeline result.</returns>
     public TResult? Run(TParam parameter)
     {
-        if (parameter == null)
-            throw new ArgumentNullException(nameof(parameter));
-
-        if (parameter == null)
-            throw new ArgumentNullException(nameof(parameter));
-
-        Parameter = parameter;
+        ArgumentNullException.ThrowIfNull(parameter);
 
         if (operations.Count == 0)
             throw new InvalidOperationException("Must have 1 or more operations configured.");
 
-        using (new ScopeStopwatch { OnStart = LogPipelineStart, OnComplete = LogPipelineFinish })
+        var runContext = new RunContext(parameter, configuredResultFactory);
+        var startTime = DateTimeOffset.Now;
+        long startTimestamp = Stopwatch.GetTimestamp();
+
+        using var activity = PipelineActivitySource.StartActivity("pipeline.run", ActivityKind.Internal);
+        activity?.SetTag("pipeline.id", Id);
+        activity?.SetTag("pipeline.name", Name);
+
+        PipelineRunCounter.Add(1);
+
+        currentRunContext.Value = runContext;
+        LogPipelineStart(startTime);
+
+        try
         {
-            try
-            {
-                return RunInternal(CancellationToken.None);
-            }
-            finally
-            {
-                Reset();
-            }
+            var result = RunInternal(runContext, CancellationToken.None);
+            activity?.SetStatus(ActivityStatusCode.Ok);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            PipelineFailureCounter.Add(1);
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetTag("exception.type", ex.GetType().FullName);
+            activity?.SetTag("exception.message", ex.Message);
+            throw;
+        }
+        finally
+        {
+            var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
+            PipelineDurationMs.Record(elapsed.TotalMilliseconds);
+            activity?.SetTag("pipeline.duration.ms", elapsed.TotalMilliseconds);
+
+            LogPipelineFinish(elapsed);
+            currentRunContext.Value = null;
+            Reset();
         }
     }
 
+    /// <summary>
+    /// Executes the pipeline asynchronously.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The pipeline result.</returns>
     /// <exception cref="OperationCanceledException" />
     public async Task<TResult?> RunAsync(TParam parameter, CancellationToken cancellationToken = default)
     {
-        if (parameter == null)
-            throw new ArgumentNullException(nameof(parameter));
-
-        Parameter = parameter;
+        ArgumentNullException.ThrowIfNull(parameter);
 
         if (operations.Count == 0)
             throw new InvalidOperationException("Must have 1 or more operations configured.");
 
-        using (new ScopeStopwatch { OnStart = LogPipelineStart, OnComplete = LogPipelineFinish })
+        var runContext = new RunContext(parameter, configuredResultFactory);
+        var startTime = DateTimeOffset.Now;
+        long startTimestamp = Stopwatch.GetTimestamp();
+
+        using var activity = PipelineActivitySource.StartActivity("pipeline.run.async", ActivityKind.Internal);
+        activity?.SetTag("pipeline.id", Id);
+        activity?.SetTag("pipeline.name", Name);
+
+        PipelineRunCounter.Add(1);
+
+        currentRunContext.Value = runContext;
+        LogPipelineStart(startTime);
+
+        try
         {
-            try
-            {
-                return await Task.Run(() => RunInternal(cancellationToken), cancellationToken).ConfigureAwait(false);
-            }
-            catch (TaskCanceledException)
-            {
-                throw new OperationCanceledException("Pipeline was cancelled.");
-            }
-            finally
-            {
-                Reset();
-            }
+            var result = await RunInternalAsync(runContext, cancellationToken).ConfigureAwait(false);
+            activity?.SetStatus(ActivityStatusCode.Ok);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            PipelineFailureCounter.Add(1);
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetTag("exception.type", ex.GetType().FullName);
+            activity?.SetTag("exception.message", ex.Message);
+            throw;
+        }
+        finally
+        {
+            var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
+            PipelineDurationMs.Record(elapsed.TotalMilliseconds);
+            activity?.SetTag("pipeline.duration.ms", elapsed.TotalMilliseconds);
+
+            LogPipelineFinish(elapsed);
+            currentRunContext.Value = null;
+            Reset();
         }
     }
 
-    public OperationPipeline<TParam, TResult> SetResult(Func<TResult?> pipelineResultFactory)
+    /// <summary>
+    /// Executes the configured pipeline for each input item from an asynchronous source.
+    /// </summary>
+    /// <param name="parameters">The asynchronous input stream.</param>
+    /// <param name="cancellationToken">A cancellation token for batch execution.</param>
+    /// <returns>An asynchronous stream of pipeline results in input order.</returns>
+    public async IAsyncEnumerable<TResult?> RunBatchAsync(
+        IAsyncEnumerable<TParam> parameters,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        if (resultFactory != null)
+        ArgumentNullException.ThrowIfNull(parameters);
+
+        await foreach (var parameter in parameters.WithCancellation(cancellationToken).ConfigureAwait(false))
+            yield return await RunAsync(parameter, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Executes the configured pipeline for each input item from a memory-backed batch.
+    /// </summary>
+    /// <param name="parameters">The memory-backed input batch.</param>
+    /// <param name="cancellationToken">A cancellation token for batch execution.</param>
+    /// <returns>A list of results in input order.</returns>
+    public async ValueTask<IReadOnlyList<TResult?>> RunBatchAsync(
+        ReadOnlyMemory<TParam> parameters,
+        CancellationToken cancellationToken = default)
+    {
+        if (parameters.IsEmpty)
+            return [];
+
+        var results = new TResult?[parameters.Length];
+
+        for (int index = 0; index < parameters.Length; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            results[index] = await RunAsync(parameters.Span[index], cancellationToken).ConfigureAwait(false);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Sets the final result factory for the pipeline.
+    /// </summary>
+    /// <param name="pipelineResultFactory">The result factory delegate.</param>
+    /// <returns>The current pipeline instance.</returns>
+    internal OperationPipeline<TParam, TResult> SetResult(Func<TResult?> pipelineResultFactory)
+    {
+        ArgumentNullException.ThrowIfNull(pipelineResultFactory);
+
+        var runContext = currentRunContext.Value;
+
+        if (runContext != null)
+        {
+            if (runContext.ResultFactory != null)
+                throw new InvalidOperationException("You can only set the result once.");
+
+            runContext.ResultFactory = pipelineResultFactory;
+            return this;
+        }
+
+        if (configuredResultFactory != null)
             throw new InvalidOperationException("You can only set the result once.");
 
-        resultFactory = pipelineResultFactory;
+        configuredResultFactory = pipelineResultFactory;
         return this;
     }
 
-    public OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Operation<TInput, TOutput> operation)
+    /// <summary>
+    /// Adds a typed operation instance.
+    /// </summary>
+    /// <typeparam name="TInput">The operation input type.</typeparam>
+    /// <typeparam name="TOutput">The operation output type.</typeparam>
+    /// <param name="operation">The operation to add.</param>
+    /// <returns>The current pipeline instance.</returns>
+    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Operation<TInput, TOutput> operation)
     {
-        if (operation == null)
-            throw new ArgumentNullException(nameof(operation));
+        ArgumentNullException.ThrowIfNull(operation);
 
         operations.Add(operation);
         return this;
     }
 
-    public OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Func<TInput, TOutput> execution, string? operationName = null,
+    /// <summary>
+    /// Adds a synchronous delegate operation.
+    /// </summary>
+    /// <typeparam name="TInput">The operation input type.</typeparam>
+    /// <typeparam name="TOutput">The operation output type.</typeparam>
+    /// <param name="execution">The execution delegate.</param>
+    /// <param name="operationName">The optional operation name.</param>
+    /// <param name="onCompletionHandler">The optional completion callback.</param>
+    /// <param name="onExceptionHandler">The optional exception handler callback.</param>
+    /// <returns>The current pipeline instance.</returns>
+    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Func<TInput, TOutput> execution, string? operationName = null,
         Action<TOutput>? onCompletionHandler = null, Func<Exception, bool>? onExceptionHandler = null)
     {
+        ArgumentNullException.ThrowIfNull(execution);
+
         AddOperation(new DelegateOperation<TInput, TOutput>(execution, operationName, null, onCompletionHandler, onExceptionHandler));
         return this;
     }
 
-    public OperationPipeline<TParam, TResult> AddConditionalOperation<TInput, TOutput>(Func<bool> ifTrueCondition, Func<TInput, TOutput> execution,
+    /// <summary>
+    /// Adds an asynchronous delegate operation.
+    /// </summary>
+    /// <typeparam name="TInput">The operation input type.</typeparam>
+    /// <typeparam name="TOutput">The operation output type.</typeparam>
+    /// <param name="execution">The asynchronous execution delegate.</param>
+    /// <param name="operationName">The optional operation name.</param>
+    /// <param name="onCompletionHandler">The optional completion callback.</param>
+    /// <param name="onExceptionHandler">The optional exception handler callback.</param>
+    /// <returns>The current pipeline instance.</returns>
+    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(
+        Func<TInput, CancellationToken, ValueTask<TOutput?>> execution,
         string? operationName = null,
-        Action<TOutput>? onCompletionHandler = null, Func<Exception, bool>? onExceptionHandler = null)
+        Action<TOutput>? onCompletionHandler = null,
+        Func<Exception, bool>? onExceptionHandler = null)
     {
-        AddOperation(new DelegateOperation<TInput, TOutput>(execution, operationName, ifTrueCondition, onCompletionHandler, onExceptionHandler));
+        ArgumentNullException.ThrowIfNull(execution);
+
+        AddOperation(new DelegateOperation<TInput, TOutput>(execution, operationName, null, onCompletionHandler, onExceptionHandler));
         return this;
     }
 
-    public OperationPipeline<TParam, TResult> AddConditionalExit<TInput, TOutput>(Func<bool> ifTrueCondition, Func<TResult?> resultFactory,
-        string? operationName = null)
-    {
-        AddOperation(
-            new DelegateOperation<object, object>(
-                _ =>
-                {
-                    earlyExitSpecified = true;
-                    SetResult(resultFactory);
-                    return new object();
-                },
-                operationName,
-                ifTrueCondition));
-        return this;
-    }
-
-    public OperationPipeline<TParam, TResult> AddPipeline<TInput, TOutput>(OperationPipeline<TInput, TOutput> pipeline, string? operationName = null,
-        Action<TOutput>? onCompletionHandler = null, Func<Exception, bool>? onExceptionHandler = null)
-    {
-        AddOperation(new DelegateOperation<TInput, TOutput>(pipeline.Run, $"Pipeline `{pipeline.Name}`"));
-        return this;
-    }
-
-    public OperationPipeline<TParam, TResult> RemoveOperationsByName(string operationName)
-    {
-        operations.RemoveAll(x => x.Name == operationName);
-        return this;
-    }
-
-    public OperationPipeline<TParam, TResult> RemoveAllOperations()
-    {
-        operations.Clear();
-        return this;
-    }
-
-    protected virtual void LogPipelineStart(DateTimeOffset now) =>
+    /// <summary>
+    /// Logs pipeline start information.
+    /// </summary>
+    /// <param name="now">The start timestamp.</param>
+    private void LogPipelineStart(DateTimeOffset now) =>
         Logger?.LogInformation("Pipeline [{PipelineId}](`{PipelineName}`) starting at {Now}...", Id, Name, now);
 
-    protected virtual void LogPipelineFinish(TimeSpan elapsed) => Logger?.LogInformation(
+    /// <summary>
+    /// Logs pipeline completion information.
+    /// </summary>
+    /// <param name="elapsed">The elapsed execution time.</param>
+    private void LogPipelineFinish(TimeSpan elapsed) => Logger?.LogInformation(
         "Pipeline [{PipelineId}](`{PipelineName}`) ended in {ElapsedMs}ms",
         Id,
         Name,
         elapsed.TotalMilliseconds);
 
-    protected virtual void LogOperationFinish(string operationName, TimeSpan elapsed) => Logger?.LogInformation(
+    /// <summary>
+    /// Logs operation completion information.
+    /// </summary>
+    /// <param name="operationName">The operation name.</param>
+    /// <param name="elapsed">The elapsed execution time.</param>
+    private void LogOperationFinish(string operationName, TimeSpan elapsed) => Logger?.LogInformation(
         "Pipeline [{PipelineId}] operation `{OperationName}` ended in {ElapsedMs}ms",
         Id,
         operationName,
         elapsed.TotalMilliseconds);
 
-    protected virtual void LogOperationStart(string operationName, DateTimeOffset now) => Logger?.LogInformation(
+    /// <summary>
+    /// Logs operation start information.
+    /// </summary>
+    /// <param name="operationName">The operation name.</param>
+    /// <param name="now">The start timestamp.</param>
+    private void LogOperationStart(string operationName, DateTimeOffset now) => Logger?.LogInformation(
         "Pipeline [{PipelineId}] operation `{OperationName}` starting at {Now}...",
         Id,
         operationName,
         now);
 
-    private void Reset()
-    {
-        resultFactory = null;
-        earlyExitSpecified = false;
-    }
+    private void Reset() => configuredResultFactory = null;
 
-    private TResult? RunInternal(CancellationToken cancellationToken = default)
+    private TResult? RunInternal(RunContext runContext, CancellationToken cancellationToken = default)
     {
         var firstOperation = operations.First();
         var lastOperation = operations.Last();
 
         object? operationResult = default(TResult?);
 
-        foreach (var operation in operations.Where(x => x.CanExecute()))
+        foreach (var operation in operations.Where(operation => operation.CanExecute()))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            using (new ScopeStopwatch
-                       { OnStart = now => LogOperationStart(operation.Name, now), OnComplete = elapsed => LogOperationFinish(operation.Name, elapsed) })
+            var startTime = DateTimeOffset.Now;
+            long startTimestamp = Stopwatch.GetTimestamp();
+
+            using var operationActivity = PipelineActivitySource.StartActivity("pipeline.operation.run", ActivityKind.Internal);
+            operationActivity?.SetTag("pipeline.id", Id);
+            operationActivity?.SetTag("pipeline.name", Name);
+            operationActivity?.SetTag("pipeline.operation.name", operation.Name);
+
+            LogOperationStart(operation.Name, startTime);
+
+            try
             {
-                try
-                {
-                    // Determine the parameter for the operation.
-                    object? operationParameter = operation == firstOperation
-                        ? Parameter
-                        : operationResult;
+                object? operationParameter = operation == firstOperation
+                    ? runContext.Parameter
+                    : operationResult;
 
-                    // Run the operation; using its input factory as a parameter.
-                    operationResult = operation.UntypedExecution(operationParameter);
+                operationResult = operation.UntypedExecution(operationParameter);
 
-                    // Operation was completed, so invoke the completion handler if there is one.
-                    operation.UntypedOnCompletionHandler?.Invoke(operationResult);
+                operation.UntypedOnCompletionHandler?.Invoke(operationResult);
+            }
+            catch (Exception ex)
+            {
+                operationActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                operationActivity?.SetTag("exception.type", ex.GetType().FullName);
+                operationActivity?.SetTag("exception.message", ex.Message);
 
-                    // Exit early conditions were met, so break.
-                    if (earlyExitSpecified)
-                        break;
-                }
-                catch (Exception ex)
-                {
-                    // If the operation has an exception handler defined,
-                    // If it doesn't have one - propagate the exception.
-                    // If it does have one - call it to see if it handles the exception, if it doesn't, we propagate it.
-                    if (!operation.OnExceptionHandler?.Invoke(ex) ?? true)
-                        throw;
-                }
-                finally
-                {
-                    // If last operation and result has not been explicitly set.
-                    // Use the last operation's result.
-                    if (resultFactory == null && operation == lastOperation)
-                        // ReSharper disable once AccessToModifiedClosure
-                        SetResult(() => (TResult?)operationResult);
-                }
+                if (!operation.OnExceptionHandler?.Invoke(ex) ?? true)
+                    throw;
+            }
+            finally
+            {
+                if (runContext.ResultFactory == null && operation == lastOperation)
+                    SetResult(() => (TResult?)operationResult);
+
+                var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
+                PipelineOperationDurationMs.Record(elapsed.TotalMilliseconds);
+                operationActivity?.SetTag("pipeline.operation.duration.ms", elapsed.TotalMilliseconds);
+
+                LogOperationFinish(operation.Name, elapsed);
             }
         }
 
-        return resultFactory!();
+        return runContext.ResultFactory!();
+    }
+
+    private async Task<TResult?> RunInternalAsync(RunContext runContext, CancellationToken cancellationToken = default)
+    {
+        var firstOperation = operations.First();
+        var lastOperation = operations.Last();
+
+        object? operationResult = default(TResult?);
+
+        foreach (var operation in operations.Where(operation => operation.CanExecute()))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var startTime = DateTimeOffset.Now;
+            long startTimestamp = Stopwatch.GetTimestamp();
+
+            using var operationActivity = PipelineActivitySource.StartActivity("pipeline.operation.run.async", ActivityKind.Internal);
+            operationActivity?.SetTag("pipeline.id", Id);
+            operationActivity?.SetTag("pipeline.name", Name);
+            operationActivity?.SetTag("pipeline.operation.name", operation.Name);
+
+            LogOperationStart(operation.Name, startTime);
+
+            try
+            {
+                object? operationParameter = operation == firstOperation
+                    ? runContext.Parameter
+                    : operationResult;
+
+                operationResult = await operation.UntypedExecutionAsync(operationParameter, cancellationToken).ConfigureAwait(false);
+
+                operation.UntypedOnCompletionHandler?.Invoke(operationResult);
+            }
+            catch (Exception ex)
+            {
+                operationActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                operationActivity?.SetTag("exception.type", ex.GetType().FullName);
+                operationActivity?.SetTag("exception.message", ex.Message);
+
+                if (!operation.OnExceptionHandler?.Invoke(ex) ?? true)
+                    throw;
+            }
+            finally
+            {
+                if (runContext.ResultFactory == null && operation == lastOperation)
+                    SetResult(() => (TResult?)operationResult);
+
+                var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
+                PipelineOperationDurationMs.Record(elapsed.TotalMilliseconds);
+                operationActivity?.SetTag("pipeline.operation.duration.ms", elapsed.TotalMilliseconds);
+
+                LogOperationFinish(operation.Name, elapsed);
+            }
+        }
+
+        return runContext.ResultFactory!();
     }
 }

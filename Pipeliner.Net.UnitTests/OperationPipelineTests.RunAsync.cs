@@ -10,18 +10,23 @@ public partial class OperationPipelineTests
     {
         var logger = loggerFactory.CreateLogger(nameof(OperationPipelineTests));
 
-        var innerPipeline = new OperationPipeline<int, int>(logger)
-            .AddOperation<int, int>(x => x + 5);
+        var innerPipeline = Pipeline
+            .For<int>(logger)
+            .Then<int>(x => x + 5)
+            .Build();
 
-        var pipeline = new OperationPipeline<string, int>(logger)
-            .AddOperation<string, int>(Convert.ToInt32)
-            .AddPipeline(innerPipeline);
+        var pipeline = Pipeline
+            .For<string>(logger)
+            .Then<int>(Convert.ToInt32)
+            .ThenAsync<int>(async (value, cancellationToken) =>
+                await innerPipeline.RunAsync(value, cancellationToken).ConfigureAwait(false))
+            .Build();
 
         int result = await pipeline.RunAsync("50");
         var logEvents = TestCorrelator.GetLogEventsFromCurrentContext();
 
         Assert.Equal(55, result);
-        Assert.Equal(10, logEvents.Count(x => x.Level == LogEventLevel.Information));
+        Assert.Equal(8, logEvents.Count(x => x.Level == LogEventLevel.Information));
     }
 
     [Fact]
@@ -88,5 +93,88 @@ public partial class OperationPipelineTests
 
         Assert.Equal(55, result);
         Assert.Equal(6, logEvents.Count(x => x.Level == LogEventLevel.Information));
+    }
+
+    [Fact]
+    public async Task RunAsync_EmbeddedPipeline_WithCustomOptions_Success()
+    {
+        // Arrange
+        const string embeddedOperationName = "Embedded operation";
+        var logger = loggerFactory.CreateLogger(nameof(OperationPipelineTests));
+
+        var innerPipeline = Pipeline
+            .For<int>(logger)
+            .Then<int>(x => x + 5)
+            .Build();
+
+        int completionValue = 0;
+
+        var pipeline = Pipeline
+            .For<string>(logger)
+            .Then<int>(Convert.ToInt32)
+            .ThenAsync<int>(async (value, cancellationToken) =>
+            {
+                var output = await innerPipeline.RunAsync(value, cancellationToken).ConfigureAwait(false);
+                completionValue = output;
+                return output;
+            })
+            .Build(embeddedOperationName);
+
+        // Act
+        int result = await pipeline.RunAsync("50");
+        var logEvents = TestCorrelator.GetLogEventsFromCurrentContext().ToList();
+
+        // Assert
+        Assert.Equal(55, result);
+        Assert.Equal(55, completionValue);
+        Assert.Contains(logEvents, logEvent => logEvent.RenderMessage().Contains(embeddedOperationName));
+    }
+
+    [Fact]
+    public async Task RunAsync_WithAsyncOperations_Success()
+    {
+        // Arrange
+        var logger = loggerFactory.CreateLogger(nameof(OperationPipelineTests));
+
+        var pipeline = new OperationPipeline<string, int>(logger)
+            .AddOperation<string, int>(
+                async (value, cancellationToken) =>
+                {
+                    await Task.Delay(5, cancellationToken);
+                    return Convert.ToInt32(value);
+                })
+            .AddOperation<int, int>(
+                async (value, cancellationToken) =>
+                {
+                    await Task.Delay(5, cancellationToken);
+                    return value + 5;
+                });
+
+        // Act
+        int result = await pipeline.RunAsync("50");
+
+        // Assert
+        Assert.Equal(55, result);
+    }
+
+    [Fact]
+    public async Task RunAsync_TypeThreadedBuilder_WithAsyncStep_Success()
+    {
+        // Arrange
+        var pipeline = Pipeline
+            .For<string>()
+            .Then<int>(Convert.ToInt32)
+            .Then<int>(async (value, cancellationToken) =>
+            {
+                await Task.Delay(5, cancellationToken);
+                return value + 5;
+            })
+            .Build();
+
+        // Act
+        int result = await pipeline.RunAsync("50");
+
+        // Assert
+        Assert.Equal(55, result);
     }
 }
