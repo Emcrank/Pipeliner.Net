@@ -1,0 +1,363 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace Pipeliner.Net;
+
+/// <summary>
+/// Represents a type-threaded pipeline builder.
+/// </summary>
+/// <typeparam name="TInput">The original pipeline input type.</typeparam>
+/// <typeparam name="TCurrent">The current output type after applied steps.</typeparam>
+public sealed class PipelineBuilder<TInput, TCurrent>
+{
+    private readonly Func<TInput, CancellationToken, ValueTask<TCurrent>> chain;
+    private readonly ILogger? logger;
+
+    /// <summary>
+    /// Initializes a new instance of <see cref="PipelineBuilder{TInput,TCurrent}" />.
+    /// </summary>
+    /// <param name="chain">The pipeline execution chain.</param>
+    /// <param name="logger">The optional logger used by built pipelines.</param>
+    internal PipelineBuilder(Func<TInput, CancellationToken, ValueTask<TCurrent>> chain, ILogger? logger)
+    {
+        ArgumentNullException.ThrowIfNull(chain);
+
+        this.chain = chain;
+        this.logger = logger;
+    }
+
+    /// <summary>
+    /// Branches execution based on a predicate.
+    /// </summary>
+    /// <typeparam name="TNext">The output type of both branches.</typeparam>
+    /// <param name="predicate">The branch condition.</param>
+    /// <param name="whenTrue">The branch executed when predicate is true.</param>
+    /// <param name="whenFalse">The branch executed when predicate is false.</param>
+    /// <returns>A new builder with the branch output type.</returns>
+    public PipelineBuilder<TInput, TNext> Branch<TNext>(
+        Func<TCurrent, bool> predicate,
+        Func<TCurrent, TNext> whenTrue,
+        Func<TCurrent, TNext> whenFalse)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        ArgumentNullException.ThrowIfNull(whenTrue);
+        ArgumentNullException.ThrowIfNull(whenFalse);
+
+        return BranchAsync(
+            predicate,
+            (current, _) => ValueTask.FromResult(whenTrue(current)),
+            (current, _) => ValueTask.FromResult(whenFalse(current)));
+    }
+
+    /// <summary>
+    /// Branches execution based on a predicate.
+    /// </summary>
+    /// <typeparam name="TNext">The output type of both branches.</typeparam>
+    /// <param name="predicate">The branch condition.</param>
+    /// <param name="whenTrue">The branch executed when predicate is true.</param>
+    /// <param name="whenFalse">The branch executed when predicate is false.</param>
+    /// <returns>A new builder with the branch output type.</returns>
+    public PipelineBuilder<TInput, TNext> BranchAsync<TNext>(
+        Func<TCurrent, bool> predicate,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> whenTrue,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> whenFalse)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        ArgumentNullException.ThrowIfNull(whenTrue);
+        ArgumentNullException.ThrowIfNull(whenFalse);
+
+        return new PipelineBuilder<TInput, TNext>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                return predicate(currentValue)
+                    ? await whenTrue(currentValue, cancellationToken).ConfigureAwait(false)
+                    : await whenFalse(currentValue, cancellationToken).ConfigureAwait(false);
+            },
+            logger);
+    }
+
+    /// <summary>
+    /// Builds an <see cref="OperationPipeline{TParam, TResult}" /> from the current chain.
+    /// </summary>
+    /// <param name="pipelineName">Optional pipeline name.</param>
+    /// <returns>The built operation pipeline.</returns>
+    public OperationPipeline<TInput, TCurrent> Build(string? pipelineName = null)
+    {
+        var pipeline = new OperationPipeline<TInput, TCurrent>(logger)
+            .AddOperation<TInput, TCurrent>(async (input, cancellationToken) =>
+                await chain(input, cancellationToken).ConfigureAwait(false));
+
+        if (!string.IsNullOrWhiteSpace(pipelineName))
+            pipeline.Name = pipelineName;
+
+        return pipeline;
+    }
+
+    /// <summary>
+    /// Executes multiple branches in parallel for the current value.
+    /// </summary>
+    /// <typeparam name="TBranch">The branch output type.</typeparam>
+    /// <param name="branches">The branch delegates to execute in parallel.</param>
+    /// <returns>A new builder whose output is a fork execution result.</returns>
+    public PipelineBuilder<TInput, ForkExecutionResult<TBranch>> Fork<TBranch>(
+        params Func<TCurrent, CancellationToken, ValueTask<TBranch>>[] branches)
+    {
+        ArgumentNullException.ThrowIfNull(branches);
+
+        if (branches.Length == 0)
+            throw new ArgumentException("At least one branch must be provided.", nameof(branches));
+
+        if (branches.Any(branch => branch is null))
+            throw new ArgumentException("All branches must be non-null.", nameof(branches));
+
+        return new PipelineBuilder<TInput, ForkExecutionResult<TBranch>>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                var branchTasks = new Task<(bool IsSuccess, TBranch Value, Exception? Error)>[branches.Length];
+
+                for (int index = 0; index < branches.Length; index++)
+                {
+                    var currentBranch = branches[index];
+                    branchTasks[index] = ExecuteBranchAsync(currentBranch, currentValue, cancellationToken);
+                }
+
+                var branchResults = await Task.WhenAll(branchTasks).ConfigureAwait(false);
+                var successfulResults = new List<TBranch>(branchResults.Length);
+                var failures = new List<Exception>(branchResults.Length);
+
+                for (int index = 0; index < branchResults.Length; index++)
+                {
+                    var branchResult = branchResults[index];
+                    if (branchResult.IsSuccess)
+                    {
+                        successfulResults.Add(branchResult.Value);
+                        continue;
+                    }
+
+                    failures.Add(branchResult.Error!);
+                }
+
+                return new ForkExecutionResult<TBranch>(successfulResults, failures);
+            },
+            logger);
+
+        static async Task<(bool IsSuccess, TBranch Value, Exception? Error)> ExecuteBranchAsync(
+            Func<TCurrent, CancellationToken, ValueTask<TBranch>> branch,
+            TCurrent currentValue,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                var value = await branch(currentValue, cancellationToken).ConfigureAwait(false);
+                return (true, value, null);
+            }
+            catch (Exception exception)
+            {
+                return (false, default!, exception);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Merges forked branch outputs into a single value.
+    /// </summary>
+    /// <typeparam name="TBranch">The branch output type.</typeparam>
+    /// <typeparam name="TNext">The merge output type.</typeparam>
+    /// <param name="mergeStep">The merge delegate.</param>
+    /// <param name="options">The merge options.</param>
+    /// <returns>A new builder with the merge output type.</returns>
+    public PipelineBuilder<TInput, TNext> Merge<TBranch, TNext>(
+        Func<IReadOnlyList<TBranch>, CancellationToken, ValueTask<TNext>> mergeStep,
+        MergeStepOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(mergeStep);
+
+        var effectiveOptions = options ?? MergeStepOptions.CustomReducer();
+
+        return new PipelineBuilder<TInput, TNext>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                if (currentValue is not ForkExecutionResult<TBranch> forkExecutionResult)
+                    throw new InvalidOperationException($"{nameof(Merge)} must be called after {nameof(Fork)}.");
+
+                if (effectiveOptions.ConflictStrategy == MergeConflictStrategy.FirstSuccess)
+                {
+                    if (forkExecutionResult.SuccessfulResults.Count > 0)
+                    {
+                        if (forkExecutionResult.SuccessfulResults[0] is TNext firstResult)
+                            return firstResult;
+
+                        throw new InvalidOperationException(
+                            $"{nameof(MergeConflictStrategy.FirstSuccess)} requires {typeof(TNext).Name} to match {typeof(TBranch).Name}.");
+                    }
+
+                    throw new AggregateException(forkExecutionResult.Failures);
+                }
+
+                if (effectiveOptions.ConflictStrategy == MergeConflictStrategy.AggregateFailures &&
+                    forkExecutionResult.Failures.Count > 0)
+                    throw new AggregateException(forkExecutionResult.Failures);
+
+                if (forkExecutionResult.SuccessfulResults.Count == 0)
+                    throw new AggregateException(forkExecutionResult.Failures);
+
+                return await mergeStep(forkExecutionResult.SuccessfulResults, cancellationToken).ConfigureAwait(false);
+            },
+            logger);
+    }
+
+    /// <summary>
+    /// Appends a synchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="step">The synchronous step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> Then<TNext>(Func<TCurrent, TNext> step)
+    {
+        ArgumentNullException.ThrowIfNull(step);
+
+        return new PipelineBuilder<TInput, TNext>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                return step(currentValue);
+            },
+            logger);
+    }
+
+    /// <summary>
+    /// Appends an asynchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="step">The asynchronous step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> Then<TNext>(Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
+        ThenAsync(step);
+
+    /// <summary>
+    /// Appends a step produced by a factory.
+    /// </summary>
+    /// <typeparam name="TStep">The step type.</typeparam>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepFactory">Factory used to create the step instance.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> Then<TStep, TNext>(Func<TStep> stepFactory)
+        where TStep : IPipelineStep<TCurrent, TNext>
+    {
+        ArgumentNullException.ThrowIfNull(stepFactory);
+
+        return ThenAsync(async (value, cancellationToken) =>
+        {
+            var step = stepFactory();
+            ArgumentNullException.ThrowIfNull(step);
+            return await step.ExecuteAsync(value, cancellationToken).ConfigureAwait(false);
+        });
+    }
+
+    /// <summary>
+    /// Appends an asynchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="step">The asynchronous step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
+        ThenAsync(step, StepExecutionOptions.None());
+
+    /// <summary>
+    /// Appends an asynchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="step">The asynchronous step delegate.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
+        StepExecutionOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(step);
+
+        var effectiveOptions = options ?? StepExecutionOptions.None();
+
+        return new PipelineBuilder<TInput, TNext>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+
+                if (effectiveOptions.Policy is { } policy)
+                    return await policy.ExecuteAsync(token => step(currentValue, token), cancellationToken).ConfigureAwait(false);
+
+                return await step(currentValue, cancellationToken).ConfigureAwait(false);
+            },
+            logger);
+    }
+
+    /// <summary>
+    /// Appends a parallel projection step for sequence outputs.
+    /// </summary>
+    /// <typeparam name="TItem">The source sequence item type.</typeparam>
+    /// <typeparam name="TNext">The destination item type.</typeparam>
+    /// <param name="step">The per-item asynchronous step.</param>
+    /// <param name="options">Parallel execution options.</param>
+    /// <returns>A new builder whose output is the projected ordered results.</returns>
+    public PipelineBuilder<TInput, IReadOnlyList<TNext>> ThenParallel<TItem, TNext>(
+        Func<TItem, CancellationToken, ValueTask<TNext>> step,
+        ParallelStepOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(step);
+
+        var effectiveOptions = options ?? ParallelStepOptions.Default();
+
+        return new PipelineBuilder<TInput, IReadOnlyList<TNext>>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                if (currentValue is not IEnumerable<TItem> sourceItems)
+                    throw new InvalidOperationException(
+                        $"{nameof(ThenParallel)} requires the current value to implement {nameof(IEnumerable<>)}.");
+
+                var items = sourceItems as IList<TItem> ?? [.. sourceItems];
+                if (items.Count == 0)
+                    return [];
+
+                var results = new TNext[items.Count];
+                var parallelOptions = new ParallelOptions
+                {
+                    CancellationToken = cancellationToken,
+                    MaxDegreeOfParallelism = effectiveOptions.MaxDegreeOfParallelism
+                };
+
+                await Parallel.ForEachAsync(
+                        Enumerable.Range(0, items.Count),
+                        parallelOptions,
+                        async (index, token) =>
+                        {
+                            results[index] = await step(items[index], token).ConfigureAwait(false);
+                        })
+                    .ConfigureAwait(false);
+
+                return results;
+            },
+            logger);
+    }
+
+    /// <summary>
+    /// Adds an execution policy around the existing chain.
+    /// </summary>
+    /// <param name="policy">The policy to apply.</param>
+    /// <returns>The current builder with wrapped execution.</returns>
+    public PipelineBuilder<TInput, TCurrent> WithPolicy(IPipelineExecutionPolicy policy)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+
+        return new PipelineBuilder<TInput, TCurrent>(
+            (input, cancellationToken) => policy.ExecuteAsync(token => chain(input, token), cancellationToken),
+            logger);
+    }
+}

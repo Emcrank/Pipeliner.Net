@@ -1,4 +1,6 @@
-# Pipeliner.Net
+# Pipeliner.Net <img src="Pipeliner.Net/Icon.png" alt="Pipeliner.Net Icon" width="40" />
+
+
 
 [![Continous Integration](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/ci.yml/badge.svg)](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/ci.yml)
 [![Release](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/release.yml/badge.svg)](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/release.yml)
@@ -35,13 +37,22 @@ dotnet add package Pipeliner.Net
 ```csharp
 var pipeline = Pipeline
     .For<string>()
-    .Then<int>(Convert.ToInt32)
-    .Then<int>(value => value + 5)
-    .Build();
+    .Then<int>(value => int.Parse(value))
+    .Branch(
+        value => value >= 0,
+        value => value,
+        _ => 0)
+    .Then<int>(value => value * 2)
+    .ThenAsync<int>(async (value, cancellationToken) =>
+    {
+        await Task.Delay(25, cancellationToken);
+        return value + 10;
+    })
+    .Build("Quick start workflow");
 
 var result = await pipeline.RunAsync("50");
 Console.WriteLine(result);
-// 55
+// 110
 ```
 
 ## Core concepts
@@ -125,6 +136,27 @@ var pipeline = Pipeline
 
 var squares = await pipeline.RunAsync([1, 2, 3, 4]);
 // [1, 4, 9, 16]
+```
+
+### 5) Branch + fork + merge
+
+```csharp
+var pipeline = Pipeline
+    .For<decimal>()
+    .Branch(
+        amount => amount >= 100m,
+        amount => amount * 0.9m,
+        amount => amount)
+    .Fork<decimal>(
+        (amount, _) => ValueTask.FromResult(amount + 5m),
+        (amount, _) => ValueTask.FromResult(amount * 1.08m),
+        (amount, _) => ValueTask.FromResult(amount - 3m))
+    .Merge<decimal, decimal>((results, _) => ValueTask.FromResult(results.Sum()))
+    .Build("Price workflow");
+
+var finalPrice = await pipeline.RunAsync(120m);
+Console.WriteLine(finalPrice);
+// 334.64
 ```
 
 ## Batch execution
