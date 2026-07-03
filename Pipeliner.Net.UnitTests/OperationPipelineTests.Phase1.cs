@@ -6,10 +6,7 @@ public partial class OperationPipelineTests
     public async Task RunBatchAsync_ReadOnlyMemory_Success()
     {
         // Arrange
-        var pipeline = new OperationPipeline<string, int>()
-            .AddOperation<string, int>(Convert.ToInt32)
-            .AddOperation<int, int>(value => value + 5);
-
+        var pipeline = CreateStringIncrementPipelineBuilder().Build();
         ReadOnlyMemory<string> inputBatch = new[] { "10", "20", "30" };
 
         // Act
@@ -23,9 +20,7 @@ public partial class OperationPipelineTests
     public async Task RunBatchAsync_IAsyncEnumerable_Success()
     {
         // Arrange
-        var pipeline = new OperationPipeline<string, int>()
-            .AddOperation<string, int>(Convert.ToInt32)
-            .AddOperation<int, int>(value => value + 5);
+        var pipeline = CreateStringIncrementPipelineBuilder().Build();
 
         // Act
         var results = new List<int>();
@@ -59,7 +54,7 @@ public partial class OperationPipelineTests
                 return values;
             })
             .WithPolicy(new RetryExecutionPolicy(2))
-            .ThenParallel<int, int>((value, _) => ValueTask.FromResult(value + 5), ParallelStepOptions.Create(2))
+            .ThenParallel<int, int>((value, _) => ValueTask.FromResult(value + IncrementByFive), ParallelStepOptions.Create(2))
             .Build();
 
         // Act
@@ -81,7 +76,7 @@ public partial class OperationPipelineTests
             .Build();
 
         // Act
-        int result = pipeline.Run("50");
+        var result = pipeline.Run(ValidNumber);
 
         // Assert
         Assert.Equal(55, result);
@@ -101,7 +96,7 @@ public partial class OperationPipelineTests
         public ValueTask<int> ExecuteAsync(int input, CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return ValueTask.FromResult(input + 5);
+            return ValueTask.FromResult(input + IncrementByFive);
         }
     }
 }

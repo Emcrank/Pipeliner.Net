@@ -16,5 +16,6 @@ public interface IPipelineExecutionPolicy
     /// <param name="execution">Delegate representing the next operation.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>The policy-wrapped result.</returns>
-    ValueTask<T> ExecuteAsync<T>(Func<CancellationToken, ValueTask<T>> execution, CancellationToken cancellationToken = default);
+    ValueTask<T> ExecuteAsync<T>(Func<CancellationToken, ValueTask<T>> execution,
+        CancellationToken cancellationToken = default);
 }

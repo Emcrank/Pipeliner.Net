@@ -9,8 +9,8 @@ public partial class OperationPipelineTests
     public void Run_Instrumentation_EmitsActivities()
     {
         // Arrange
-        int startedCount = 0;
-        int stoppedCount = 0;
+        var startedCount = 0;
+        var stoppedCount = 0;
 
         using var activityListener = new ActivityListener
         {
@@ -22,9 +22,11 @@ public partial class OperationPipelineTests
 
         ActivitySource.AddActivityListener(activityListener);
 
-        var pipeline = new OperationPipeline<string, int>()
-            .AddOperation<string, int>(Convert.ToInt32)
-            .AddOperation<int, int>(value => value + 5);
+        var pipeline = Pipeline
+            .For<string>()
+            .Then<int>(Convert.ToInt32)
+            .Then<int>(value => value + 5)
+            .Build();
 
         // Act
         _ = pipeline.Run("50");
@@ -38,7 +40,7 @@ public partial class OperationPipelineTests
     public void Run_Instrumentation_EmitsMeterMetrics()
     {
         // Arrange
-        long runCount = 0;
+        var runCount = 0L;
 
         using var meterListener = new MeterListener();
         meterListener.InstrumentPublished = (instrument, listener) =>
@@ -55,9 +57,11 @@ public partial class OperationPipelineTests
 
         meterListener.Start();
 
-        var pipeline = new OperationPipeline<string, int>()
-            .AddOperation<string, int>(Convert.ToInt32)
-            .AddOperation<int, int>(value => value + 5);
+        var pipeline = Pipeline
+            .For<string>()
+            .Then<int>(Convert.ToInt32)
+            .Then<int>(value => value + 5)
+            .Build();
 
         // Act
         _ = pipeline.Run("50");

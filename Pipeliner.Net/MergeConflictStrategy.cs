@@ -1,22 +1,37 @@
 namespace Pipeliner.Net;
 
 /// <summary>
-/// Defines merge behavior for forked branch outputs.
+/// Defines built-in merge behavior for forked branch outputs.
 /// </summary>
 public enum MergeConflictStrategy
 {
     /// <summary>
+    /// Throws an aggregate exception if any branch failed before merge execution.
+    /// </summary>
+    ThrowOnAnyFailure,
+
+    /// <summary>
+    /// Ignores failed branches and continues with successful results only.
+    /// </summary>
+    IgnoreFailures,
+
+    /// <summary>
     /// Returns the first successful branch result.
     /// </summary>
-    FirstSuccess,
+    TakeFirst,
 
     /// <summary>
-    /// Throws an aggregate exception if any branch fails before merge execution.
+    /// Invokes the custom reducer delegate.
     /// </summary>
-    AggregateFailures,
+    CustomReducer,
 
     /// <summary>
-    /// Invokes the custom reducer and allows handling partial successes.
+    /// Backward-compatible alias for <see cref="TakeFirst" />.
     /// </summary>
-    CustomReducer
+    FirstSuccess = TakeFirst,
+
+    /// <summary>
+    /// Backward-compatible alias for <see cref="ThrowOnAnyFailure" />.
+    /// </summary>
+    AggregateFailures = ThrowOnAnyFailure
 }

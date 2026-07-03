@@ -5,7 +5,8 @@ using System.Threading.Tasks;
 namespace Pipeliner.Net;
 
 /// <summary>
-/// Represents a typed operation that can execute synchronously or asynchronously within an <see cref="OperationPipeline{TParam,TResult}"/>.
+/// Represents a typed operation that can execute synchronously or asynchronously within an
+/// <see cref="OperationPipeline{TParam,TResult}" />.
 /// </summary>
 /// <typeparam name="TInput">The operation input type.</typeparam>
 /// <typeparam name="TResult">The operation output type.</typeparam>
@@ -36,6 +37,14 @@ public abstract class Operation<TInput, TResult> : IUntypedOperation
     /// </summary>
     public virtual Func<bool> CanExecute => DelegateDefaults.CanExecute.Always;
 
+    Func<object?, object?> IUntypedOperation.UntypedExecution => value => Execution((TInput)value!);
+
+    Func<object?, CancellationToken, ValueTask<object?>> IUntypedOperation.UntypedExecutionAsync =>
+        async (value, cancellationToken) => await ExecuteAsync((TInput)value!, cancellationToken).ConfigureAwait(false);
+
+    Action<object?> IUntypedOperation.UntypedOnCompletionHandler =>
+        value => OnCompletionHandler.Invoke((TResult)value!);
+
     /// <summary>
     /// Executes the operation asynchronously.
     /// </summary>
@@ -44,12 +53,4 @@ public abstract class Operation<TInput, TResult> : IUntypedOperation
     /// <returns>The operation output.</returns>
     public virtual ValueTask<TResult?> ExecuteAsync(TInput input, CancellationToken cancellationToken = default) =>
         ValueTask.FromResult(Execution(input));
-
-    Func<object?, object?> IUntypedOperation.UntypedExecution => value => Execution((TInput)value!);
-
-    Func<object?, CancellationToken, ValueTask<object?>> IUntypedOperation.UntypedExecutionAsync =>
-        async (value, cancellationToken) => await ExecuteAsync((TInput)value!, cancellationToken).ConfigureAwait(false);
-
-    Action<object?> IUntypedOperation.UntypedOnCompletionHandler =>
-        value => OnCompletionHandler.Invoke((TResult)value!);
 }

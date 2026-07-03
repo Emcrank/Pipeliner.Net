@@ -96,8 +96,8 @@ var result = await pipeline.RunAsync("10");
 ```csharp
 public sealed class AddTaxStep : IPipelineStep<decimal, decimal>
 {
-    public ValueTask<decimal> ExecuteAsync(decimal input, CancellationToken cancellationToken = default)
-        => ValueTask.FromResult(input * 1.2m);
+    public ValueTask<decimal> ExecuteAsync(decimal input, CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult(input * 1.2m);
 }
 
 var pipeline = Pipeline
@@ -124,7 +124,105 @@ var pipeline = Pipeline
     .Build();
 ```
 
-### 4) Parallel projection
+### 4) Pipeline-level execution policy
+
+```csharp
+var pipeline = Pipeline
+    .For<int>()
+    .ThenAsync<int>((value, _) => ValueTask.FromResult(value + 1))
+    .WithPolicy(new RetryExecutionPolicy(2))
+    .Build();
+```
+
+### 5) Branch and branch async
+
+```csharp
+var pipeline = Pipeline
+    .For<int>()
+    .Branch(
+        value => value >= 0,
+        value => value,
+        _ => 0)
+    .BranchAsync(
+        value => value > 100,
+        (value, _) => ValueTask.FromResult($"large:{value}"),
+        (value, _) => ValueTask.FromResult($"small:{value}"))
+    .Build();
+
+var label = await pipeline.RunAsync(150);
+// large:150
+```
+
+### 6) Fork + merge (custom reducer)
+
+```csharp
+var pipeline = Pipeline
+    .For<decimal>()
+    .Fork<decimal>(
+        (amount, _) => ValueTask.FromResult(amount + 5m),
+        (amount, _) => ValueTask.FromResult(amount * 1.08m),
+        (amount, _) => ValueTask.FromResult(amount - 3m))
+    .Merge<decimal, decimal>((results, _) => ValueTask.FromResult(results.Sum()), MergeStepOptions.CustomReducer())
+    .Build("Price workflow");
+
+var finalPrice = await pipeline.RunAsync(120m);
+Console.WriteLine(finalPrice);
+// 371.6
+```
+
+### 7) Built-in merge strategy: throw on any failure
+
+```csharp
+var pipeline = Pipeline
+    .For<int>()
+    .Fork<int>(
+        (value, _) => ValueTask.FromResult(value + 1),
+        (_, _) => ValueTask.FromException<int>(new InvalidOperationException("branch failed")),
+        (value, _) => ValueTask.FromResult(value + 3))
+    .Merge<int, IReadOnlyList<int>>(
+        (results, _) => ValueTask.FromResult<IReadOnlyList<int>>(results),
+        MergeStepOptions.ThrowOnAnyFailure())
+    .Build();
+
+await Assert.ThrowsAsync<AggregateException>(() => pipeline.RunAsync(10));
+```
+
+### 8) Built-in merge strategy: ignore failures
+
+```csharp
+var pipeline = Pipeline
+    .For<int>()
+    .Fork<int>(
+        (value, _) => ValueTask.FromResult(value + 1),
+        (_, _) => ValueTask.FromException<int>(new InvalidOperationException("branch failed")),
+        (value, _) => ValueTask.FromResult(value + 3))
+    .Merge<int, IReadOnlyList<int>>(
+        (results, _) => ValueTask.FromResult<IReadOnlyList<int>>(results),
+        MergeStepOptions.IgnoreFailures())
+    .Build();
+
+var results = await pipeline.RunAsync(10);
+// [11, 13]
+```
+
+### 9) Built-in merge strategy: take first
+
+```csharp
+var pipeline = Pipeline
+    .For<int>()
+    .Fork<int>(
+        (value, _) => ValueTask.FromResult(value + 1),
+        (value, _) => ValueTask.FromResult(value + 2))
+    .Merge<int, int>(
+        (results, _) => ValueTask.FromResult(results[0]),
+        MergeStepOptions.TakeFirst())
+    .Build();
+
+var first = await pipeline.RunAsync(10);
+// 11
+```
+
+### 10) Parallel projection
 
 ```csharp
 var pipeline = Pipeline
@@ -136,27 +234,6 @@ var pipeline = Pipeline
 
 var squares = await pipeline.RunAsync([1, 2, 3, 4]);
 // [1, 4, 9, 16]
-```
-
-### 5) Branch + fork + merge
-
-```csharp
-var pipeline = Pipeline
-    .For<decimal>()
-    .Branch(
-        amount => amount >= 100m,
-        amount => amount * 0.9m,
-        amount => amount)
-    .Fork<decimal>(
-        (amount, _) => ValueTask.FromResult(amount + 5m),
-        (amount, _) => ValueTask.FromResult(amount * 1.08m),
-        (amount, _) => ValueTask.FromResult(amount - 3m))
-    .Merge<decimal, decimal>((results, _) => ValueTask.FromResult(results.Sum()))
-    .Build("Price workflow");
-
-var finalPrice = await pipeline.RunAsync(120m);
-Console.WriteLine(finalPrice);
-// 334.64
 ```
 
 ## Batch execution
@@ -194,6 +271,68 @@ await foreach (var item in pipeline.RunBatchAsync(GetInputsAsync()))
 {
     Console.WriteLine(item);
 }
+```
+
+## Stream execution with backpressure
+
+### Stream builder quick start
+
+```csharp
+var streamPipeline = Pipeline
+    .StreamFor<string>()
+    .Then<int>(int.Parse)
+    .ThenAsync<int>(async (value, cancellationToken) =>
+    {
+        await Task.Delay(10, cancellationToken);
+        return value + 1;
+    })
+    .Build("Stream parse and increment");
+
+await foreach (var item in streamPipeline.RunStreamAsync(GetInputsAsync()))
+{
+    Console.WriteLine(item);
+}
+```
+
+### Configure bounded channel backpressure
+
+```csharp
+var streamPipeline = Pipeline
+    .StreamFor<int>()
+    .WithBackpressure(BackpressureOptions.Create(256, BackpressureMode.Wait))
+    .Then<int>(value => value * 2)
+    .Build();
+```
+
+Available backpressure modes:
+
+- `BackpressureMode.Wait`
+- `BackpressureMode.DropNewest`
+- `BackpressureMode.DropOldest`
+- `BackpressureMode.DropWrite`
+
+## MergeReducers helper
+
+Use `MergeReducers` directly when you need custom aggregation over detailed branch outcomes (`ForkResult<T>`):
+
+```csharp
+var forkPipeline = Pipeline
+    .For<int>()
+    .Fork<int>(
+        (value, _) => ValueTask.FromResult(value + 1),
+        (_, _) => ValueTask.FromException<int>(new InvalidOperationException("branch failed")),
+        (value, _) => ValueTask.FromResult(value + 3))
+    .Build();
+
+var forkExecution = await forkPipeline.RunAsync(10);
+
+var reduced = await MergeReducers.ReduceAsync(
+    forkExecution.BranchResults,
+    0,
+    (acc, value, _) => ValueTask.FromResult(acc + value));
+
+Console.WriteLine(reduced);
+// 24
 ```
 
 ## Dependency injection friendly operations
@@ -245,8 +384,10 @@ Current API includes:
 - async-first delegates with `ValueTask`,
 - typed fluent composition,
 - batch APIs,
+- streaming APIs with channel-backed backpressure,
 - policy hooks,
 - branch/fork/merge capabilities,
+- built-in merge conflict strategies and reducers,
 - instrumentation support.
 
-Future phases can add channel-backed streaming and backpressure runtime modes without breaking request-response usage.
+Future phases can expand higher-level integration helpers and additional execution policies without breaking request-response usage.

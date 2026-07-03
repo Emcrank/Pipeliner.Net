@@ -10,10 +10,12 @@ namespace Pipeliner.Net;
 /// <param name="maxAttempts">The maximum attempt count.</param>
 public sealed class RetryExecutionPolicy(int maxAttempts) : IPipelineExecutionPolicy
 {
-    private readonly int attempts = maxAttempts < 1 ? throw new ArgumentOutOfRangeException(nameof(maxAttempts)) : maxAttempts;
+    private readonly int attempts =
+        maxAttempts < 1 ? throw new ArgumentOutOfRangeException(nameof(maxAttempts)) : maxAttempts;
 
     /// <inheritdoc />
-    public async ValueTask<T> ExecuteAsync<T>(Func<CancellationToken, ValueTask<T>> execution, CancellationToken cancellationToken = default)
+    public async ValueTask<T> ExecuteAsync<T>(Func<CancellationToken, ValueTask<T>> execution,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(execution);
 

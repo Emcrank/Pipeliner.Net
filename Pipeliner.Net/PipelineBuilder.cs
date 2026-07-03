@@ -105,7 +105,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="branches">The branch delegates to execute in parallel.</param>
     /// <returns>A new builder whose output is a fork execution result.</returns>
     public PipelineBuilder<TInput, ForkExecutionResult<TBranch>> Fork<TBranch>(
-        params Func<TCurrent, CancellationToken, ValueTask<TBranch>>[] branches)
+        params Func<TCurrent, CancellationToken, ValueTask<TBranch>>?[] branches)
     {
         ArgumentNullException.ThrowIfNull(branches);
 
@@ -119,47 +119,33 @@ public sealed class PipelineBuilder<TInput, TCurrent>
             async (input, cancellationToken) =>
             {
                 var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
-                var branchTasks = new Task<(bool IsSuccess, TBranch Value, Exception? Error)>[branches.Length];
+                var branchTasks = new Task<ForkResult<TBranch>>[branches.Length];
 
                 for (int index = 0; index < branches.Length; index++)
                 {
-                    var currentBranch = branches[index];
-                    branchTasks[index] = ExecuteBranchAsync(currentBranch, currentValue, cancellationToken);
+                    var currentBranch = branches[index]!;
+                    branchTasks[index] = ExecuteBranchAsync(currentBranch, currentValue, index, cancellationToken);
                 }
 
                 var branchResults = await Task.WhenAll(branchTasks).ConfigureAwait(false);
-                var successfulResults = new List<TBranch>(branchResults.Length);
-                var failures = new List<Exception>(branchResults.Length);
-
-                for (int index = 0; index < branchResults.Length; index++)
-                {
-                    var branchResult = branchResults[index];
-                    if (branchResult.IsSuccess)
-                    {
-                        successfulResults.Add(branchResult.Value);
-                        continue;
-                    }
-
-                    failures.Add(branchResult.Error!);
-                }
-
-                return new ForkExecutionResult<TBranch>(successfulResults, failures);
+                return new ForkExecutionResult<TBranch>(branchResults);
             },
             logger);
 
-        static async Task<(bool IsSuccess, TBranch Value, Exception? Error)> ExecuteBranchAsync(
+        static async Task<ForkResult<TBranch>> ExecuteBranchAsync(
             Func<TCurrent, CancellationToken, ValueTask<TBranch>> branch,
             TCurrent currentValue,
+            int index,
             CancellationToken cancellationToken)
         {
             try
             {
                 var value = await branch(currentValue, cancellationToken).ConfigureAwait(false);
-                return (true, value, null);
+                return new ForkResult<TBranch>(index, true, value, null);
             }
             catch (Exception exception)
             {
-                return (false, default!, exception);
+                return new ForkResult<TBranch>(index, false, default, exception);
             }
         }
     }
@@ -187,28 +173,47 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                 if (currentValue is not ForkExecutionResult<TBranch> forkExecutionResult)
                     throw new InvalidOperationException($"{nameof(Merge)} must be called after {nameof(Fork)}.");
 
-                if (effectiveOptions.ConflictStrategy == MergeConflictStrategy.FirstSuccess)
+                if (effectiveOptions.ConflictStrategy == MergeConflictStrategy.ThrowOnAnyFailure)
                 {
-                    if (forkExecutionResult.SuccessfulResults.Count > 0)
-                    {
-                        if (forkExecutionResult.SuccessfulResults[0] is TNext firstResult)
-                            return firstResult;
+                    var successfulResults = await MergeReducers
+                        .ThrowOnAnyFailureAsync(forkExecutionResult.BranchResults, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (successfulResults is TNext typedResults)
+                        return typedResults;
 
-                        throw new InvalidOperationException(
-                            $"{nameof(MergeConflictStrategy.FirstSuccess)} requires {typeof(TNext).Name} to match {typeof(TBranch).Name}.");
-                    }
-
-                    throw new AggregateException(forkExecutionResult.Failures);
+                    throw new InvalidOperationException(
+                        $"{nameof(MergeConflictStrategy.ThrowOnAnyFailure)} requires {typeof(TNext).Name} to be assignable from {typeof(IReadOnlyList<TBranch>).Name}.");
                 }
 
-                if (effectiveOptions.ConflictStrategy == MergeConflictStrategy.AggregateFailures &&
-                    forkExecutionResult.Failures.Count > 0)
+                if (effectiveOptions.ConflictStrategy == MergeConflictStrategy.IgnoreFailures)
+                {
+                    var successfulResults = await MergeReducers
+                        .IgnoreFailuresAsync(forkExecutionResult.BranchResults, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (successfulResults is TNext typedResults)
+                        return typedResults;
+
+                    throw new InvalidOperationException(
+                        $"{nameof(MergeConflictStrategy.IgnoreFailures)} requires {typeof(TNext).Name} to be assignable from {typeof(IReadOnlyList<TBranch>).Name}.");
+                }
+
+                if (effectiveOptions.ConflictStrategy == MergeConflictStrategy.TakeFirst)
+                {
+                    var firstResult = await MergeReducers
+                        .TakeFirstAsync(forkExecutionResult.BranchResults, cancellationToken).ConfigureAwait(false);
+                    if (firstResult is TNext typedFirstResult)
+                        return typedFirstResult;
+
+                    throw new InvalidOperationException(
+                        $"{nameof(MergeConflictStrategy.TakeFirst)} requires {typeof(TNext).Name} to match {typeof(TBranch).Name}.");
+                }
+
+                var successfulResultsForMerge = await MergeReducers
+                    .IgnoreFailuresAsync(forkExecutionResult.BranchResults, cancellationToken).ConfigureAwait(false);
+                if (successfulResultsForMerge.Count == 0)
                     throw new AggregateException(forkExecutionResult.Failures);
 
-                if (forkExecutionResult.SuccessfulResults.Count == 0)
-                    throw new AggregateException(forkExecutionResult.Failures);
-
-                return await mergeStep(forkExecutionResult.SuccessfulResults, cancellationToken).ConfigureAwait(false);
+                return await mergeStep(successfulResultsForMerge, cancellationToken).ConfigureAwait(false);
             },
             logger);
     }
@@ -291,7 +296,8 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                 var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
 
                 if (effectiveOptions.Policy is { } policy)
-                    return await policy.ExecuteAsync(token => step(currentValue, token), cancellationToken).ConfigureAwait(false);
+                    return await policy.ExecuteAsync(token => step(currentValue, token), cancellationToken)
+                        .ConfigureAwait(false);
 
                 return await step(currentValue, cancellationToken).ConfigureAwait(false);
             },

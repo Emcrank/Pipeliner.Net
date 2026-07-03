@@ -1,12 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Diagnostics.Metrics;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-using System.Runtime.CompilerServices;
 
 namespace Pipeliner.Net;
 
@@ -17,26 +16,12 @@ namespace Pipeliner.Net;
 /// <typeparam name="TResult">The pipeline result type.</typeparam>
 public sealed class OperationPipeline<TParam, TResult>
 {
-    private static readonly ActivitySource PipelineActivitySource = new("Pipeliner.Net");
-    private static readonly Meter PipelineMeter = new("Pipeliner.Net");
-    private static readonly Counter<long> PipelineRunCounter = PipelineMeter.CreateCounter<long>("pipeliner.pipeline.runs");
-    private static readonly Counter<long> PipelineFailureCounter = PipelineMeter.CreateCounter<long>("pipeliner.pipeline.failures");
-    private static readonly Histogram<double> PipelineDurationMs = PipelineMeter.CreateHistogram<double>("pipeliner.pipeline.duration.ms");
-    private static readonly Histogram<double> PipelineOperationDurationMs = PipelineMeter.CreateHistogram<double>("pipeliner.pipeline.operation.duration.ms");
-
     private readonly List<IUntypedOperation> operations = [];
     private readonly AsyncLocal<RunContext?> currentRunContext = new();
     private Func<TResult?>? configuredResultFactory;
 
-    private sealed class RunContext(TParam parameter, Func<TResult?>? resultFactory)
-    {
-        public TParam Parameter { get; } = parameter;
-
-        public Func<TResult?>? ResultFactory { get; set; } = resultFactory;
-    }
-
     /// <summary>
-    /// Initializes a new instance of <see cref="OperationPipeline{TParam,TResult}"/>
+    /// Initializes a new instance of <see cref="OperationPipeline{TParam,TResult}" />
     /// </summary>
     /// <param name="logger">The optional logger for pipeline diagnostics.</param>
     internal OperationPipeline(ILogger? logger = null)
@@ -80,11 +65,11 @@ public sealed class OperationPipeline<TParam, TResult>
         var startTime = DateTimeOffset.Now;
         long startTimestamp = Stopwatch.GetTimestamp();
 
-        using var activity = PipelineActivitySource.StartActivity("pipeline.run", ActivityKind.Internal);
+        using var activity = PipelineTelemetry.ActivitySource.StartActivity("pipeline.run");
         activity?.SetTag("pipeline.id", Id);
         activity?.SetTag("pipeline.name", Name);
 
-        PipelineRunCounter.Add(1);
+        PipelineTelemetry.PipelineRunCounter.Add(1);
 
         currentRunContext.Value = runContext;
         LogPipelineStart(startTime);
@@ -97,7 +82,7 @@ public sealed class OperationPipeline<TParam, TResult>
         }
         catch (Exception ex)
         {
-            PipelineFailureCounter.Add(1);
+            PipelineTelemetry.PipelineFailureCounter.Add(1);
             activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             activity?.SetTag("exception.type", ex.GetType().FullName);
             activity?.SetTag("exception.message", ex.Message);
@@ -106,7 +91,7 @@ public sealed class OperationPipeline<TParam, TResult>
         finally
         {
             var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
-            PipelineDurationMs.Record(elapsed.TotalMilliseconds);
+            PipelineTelemetry.PipelineDurationMs.Record(elapsed.TotalMilliseconds);
             activity?.SetTag("pipeline.duration.ms", elapsed.TotalMilliseconds);
 
             LogPipelineFinish(elapsed);
@@ -133,11 +118,11 @@ public sealed class OperationPipeline<TParam, TResult>
         var startTime = DateTimeOffset.Now;
         long startTimestamp = Stopwatch.GetTimestamp();
 
-        using var activity = PipelineActivitySource.StartActivity("pipeline.run.async", ActivityKind.Internal);
+        using var activity = PipelineTelemetry.ActivitySource.StartActivity("pipeline.run.async");
         activity?.SetTag("pipeline.id", Id);
         activity?.SetTag("pipeline.name", Name);
 
-        PipelineRunCounter.Add(1);
+        PipelineTelemetry.PipelineRunCounter.Add(1);
 
         currentRunContext.Value = runContext;
         LogPipelineStart(startTime);
@@ -150,7 +135,7 @@ public sealed class OperationPipeline<TParam, TResult>
         }
         catch (Exception ex)
         {
-            PipelineFailureCounter.Add(1);
+            PipelineTelemetry.PipelineFailureCounter.Add(1);
             activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             activity?.SetTag("exception.type", ex.GetType().FullName);
             activity?.SetTag("exception.message", ex.Message);
@@ -159,7 +144,7 @@ public sealed class OperationPipeline<TParam, TResult>
         finally
         {
             var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
-            PipelineDurationMs.Record(elapsed.TotalMilliseconds);
+            PipelineTelemetry.PipelineDurationMs.Record(elapsed.TotalMilliseconds);
             activity?.SetTag("pipeline.duration.ms", elapsed.TotalMilliseconds);
 
             LogPipelineFinish(elapsed);
@@ -209,6 +194,76 @@ public sealed class OperationPipeline<TParam, TResult>
     }
 
     /// <summary>
+    /// Adds a typed operation instance.
+    /// </summary>
+    /// <typeparam name="TInput">The operation input type.</typeparam>
+    /// <typeparam name="TOutput">The operation output type.</typeparam>
+    /// <param name="operation">The operation to add.</param>
+    /// <returns>The current pipeline instance.</returns>
+    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Operation<TInput, TOutput> operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+
+        operations.Add(operation);
+        return this;
+    }
+
+    /// <summary>
+    /// Adds a synchronous delegate operation.
+    /// </summary>
+    /// <typeparam name="TInput">The operation input type.</typeparam>
+    /// <typeparam name="TOutput">The operation output type.</typeparam>
+    /// <param name="execution">The execution delegate.</param>
+    /// <param name="operationName">The optional operation name.</param>
+    /// <param name="onCompletionHandler">The optional completion callback.</param>
+    /// <param name="onExceptionHandler">The optional exception handler callback.</param>
+    /// <returns>The current pipeline instance.</returns>
+    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Func<TInput, TOutput> execution,
+        string? operationName = null,
+        Action<TOutput>? onCompletionHandler = null,
+        Func<Exception, bool>? onExceptionHandler = null)
+    {
+        ArgumentNullException.ThrowIfNull(execution);
+
+        AddOperation(
+            new DelegateOperation<TInput, TOutput>(
+                execution,
+                operationName,
+                null,
+                onCompletionHandler,
+                onExceptionHandler));
+        return this;
+    }
+
+    /// <summary>
+    /// Adds an asynchronous delegate operation.
+    /// </summary>
+    /// <typeparam name="TInput">The operation input type.</typeparam>
+    /// <typeparam name="TOutput">The operation output type.</typeparam>
+    /// <param name="execution">The asynchronous execution delegate.</param>
+    /// <param name="operationName">The optional operation name.</param>
+    /// <param name="onCompletionHandler">The optional completion callback.</param>
+    /// <param name="onExceptionHandler">The optional exception handler callback.</param>
+    /// <returns>The current pipeline instance.</returns>
+    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(
+        Func<TInput, CancellationToken, ValueTask<TOutput?>> execution,
+        string? operationName = null,
+        Action<TOutput>? onCompletionHandler = null,
+        Func<Exception, bool>? onExceptionHandler = null)
+    {
+        ArgumentNullException.ThrowIfNull(execution);
+
+        AddOperation(
+            new DelegateOperation<TInput, TOutput>(
+                execution,
+                operationName,
+                null,
+                onCompletionHandler,
+                onExceptionHandler));
+        return this;
+    }
+
+    /// <summary>
     /// Sets the final result factory for the pipeline.
     /// </summary>
     /// <param name="pipelineResultFactory">The result factory delegate.</param>
@@ -236,79 +291,6 @@ public sealed class OperationPipeline<TParam, TResult>
     }
 
     /// <summary>
-    /// Adds a typed operation instance.
-    /// </summary>
-    /// <typeparam name="TInput">The operation input type.</typeparam>
-    /// <typeparam name="TOutput">The operation output type.</typeparam>
-    /// <param name="operation">The operation to add.</param>
-    /// <returns>The current pipeline instance.</returns>
-    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Operation<TInput, TOutput> operation)
-    {
-        ArgumentNullException.ThrowIfNull(operation);
-
-        operations.Add(operation);
-        return this;
-    }
-
-    /// <summary>
-    /// Adds a synchronous delegate operation.
-    /// </summary>
-    /// <typeparam name="TInput">The operation input type.</typeparam>
-    /// <typeparam name="TOutput">The operation output type.</typeparam>
-    /// <param name="execution">The execution delegate.</param>
-    /// <param name="operationName">The optional operation name.</param>
-    /// <param name="onCompletionHandler">The optional completion callback.</param>
-    /// <param name="onExceptionHandler">The optional exception handler callback.</param>
-    /// <returns>The current pipeline instance.</returns>
-    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(Func<TInput, TOutput> execution, string? operationName = null,
-        Action<TOutput>? onCompletionHandler = null, Func<Exception, bool>? onExceptionHandler = null)
-    {
-        ArgumentNullException.ThrowIfNull(execution);
-
-        AddOperation(new DelegateOperation<TInput, TOutput>(execution, operationName, null, onCompletionHandler, onExceptionHandler));
-        return this;
-    }
-
-    /// <summary>
-    /// Adds an asynchronous delegate operation.
-    /// </summary>
-    /// <typeparam name="TInput">The operation input type.</typeparam>
-    /// <typeparam name="TOutput">The operation output type.</typeparam>
-    /// <param name="execution">The asynchronous execution delegate.</param>
-    /// <param name="operationName">The optional operation name.</param>
-    /// <param name="onCompletionHandler">The optional completion callback.</param>
-    /// <param name="onExceptionHandler">The optional exception handler callback.</param>
-    /// <returns>The current pipeline instance.</returns>
-    internal OperationPipeline<TParam, TResult> AddOperation<TInput, TOutput>(
-        Func<TInput, CancellationToken, ValueTask<TOutput?>> execution,
-        string? operationName = null,
-        Action<TOutput>? onCompletionHandler = null,
-        Func<Exception, bool>? onExceptionHandler = null)
-    {
-        ArgumentNullException.ThrowIfNull(execution);
-
-        AddOperation(new DelegateOperation<TInput, TOutput>(execution, operationName, null, onCompletionHandler, onExceptionHandler));
-        return this;
-    }
-
-    /// <summary>
-    /// Logs pipeline start information.
-    /// </summary>
-    /// <param name="now">The start timestamp.</param>
-    private void LogPipelineStart(DateTimeOffset now) =>
-        Logger?.LogInformation("Pipeline [{PipelineId}](`{PipelineName}`) starting at {Now}...", Id, Name, now);
-
-    /// <summary>
-    /// Logs pipeline completion information.
-    /// </summary>
-    /// <param name="elapsed">The elapsed execution time.</param>
-    private void LogPipelineFinish(TimeSpan elapsed) => Logger?.LogInformation(
-        "Pipeline [{PipelineId}](`{PipelineName}`) ended in {ElapsedMs}ms",
-        Id,
-        Name,
-        elapsed.TotalMilliseconds);
-
-    /// <summary>
     /// Logs operation completion information.
     /// </summary>
     /// <param name="operationName">The operation name.</param>
@@ -330,6 +312,23 @@ public sealed class OperationPipeline<TParam, TResult>
         operationName,
         now);
 
+    /// <summary>
+    /// Logs pipeline completion information.
+    /// </summary>
+    /// <param name="elapsed">The elapsed execution time.</param>
+    private void LogPipelineFinish(TimeSpan elapsed) => Logger?.LogInformation(
+        "Pipeline [{PipelineId}](`{PipelineName}`) ended in {ElapsedMs}ms",
+        Id,
+        Name,
+        elapsed.TotalMilliseconds);
+
+    /// <summary>
+    /// Logs pipeline start information.
+    /// </summary>
+    /// <param name="now">The start timestamp.</param>
+    private void LogPipelineStart(DateTimeOffset now) =>
+        Logger?.LogInformation("Pipeline [{PipelineId}](`{PipelineName}`) starting at {Now}...", Id, Name, now);
+
     private void Reset() => configuredResultFactory = null;
 
     private TResult? RunInternal(RunContext runContext, CancellationToken cancellationToken = default)
@@ -346,7 +345,7 @@ public sealed class OperationPipeline<TParam, TResult>
             var startTime = DateTimeOffset.Now;
             long startTimestamp = Stopwatch.GetTimestamp();
 
-            using var operationActivity = PipelineActivitySource.StartActivity("pipeline.operation.run", ActivityKind.Internal);
+            using var operationActivity = PipelineTelemetry.ActivitySource.StartActivity("pipeline.operation.run");
             operationActivity?.SetTag("pipeline.id", Id);
             operationActivity?.SetTag("pipeline.name", Name);
             operationActivity?.SetTag("pipeline.operation.name", operation.Name);
@@ -375,10 +374,13 @@ public sealed class OperationPipeline<TParam, TResult>
             finally
             {
                 if (runContext.ResultFactory == null && operation == lastOperation)
-                    SetResult(() => (TResult?)operationResult);
+                {
+                    object? finalOperationResult = operationResult;
+                    SetResult(() => (TResult?)finalOperationResult);
+                }
 
                 var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
-                PipelineOperationDurationMs.Record(elapsed.TotalMilliseconds);
+                PipelineTelemetry.PipelineOperationDurationMs.Record(elapsed.TotalMilliseconds);
                 operationActivity?.SetTag("pipeline.operation.duration.ms", elapsed.TotalMilliseconds);
 
                 LogOperationFinish(operation.Name, elapsed);
@@ -402,7 +404,8 @@ public sealed class OperationPipeline<TParam, TResult>
             var startTime = DateTimeOffset.Now;
             long startTimestamp = Stopwatch.GetTimestamp();
 
-            using var operationActivity = PipelineActivitySource.StartActivity("pipeline.operation.run.async", ActivityKind.Internal);
+            using var operationActivity =
+                PipelineTelemetry.ActivitySource.StartActivity("pipeline.operation.run.async");
             operationActivity?.SetTag("pipeline.id", Id);
             operationActivity?.SetTag("pipeline.name", Name);
             operationActivity?.SetTag("pipeline.operation.name", operation.Name);
@@ -415,7 +418,8 @@ public sealed class OperationPipeline<TParam, TResult>
                     ? runContext.Parameter
                     : operationResult;
 
-                operationResult = await operation.UntypedExecutionAsync(operationParameter, cancellationToken).ConfigureAwait(false);
+                operationResult = await operation.UntypedExecutionAsync(operationParameter, cancellationToken)
+                    .ConfigureAwait(false);
 
                 operation.UntypedOnCompletionHandler?.Invoke(operationResult);
             }
@@ -431,10 +435,13 @@ public sealed class OperationPipeline<TParam, TResult>
             finally
             {
                 if (runContext.ResultFactory == null && operation == lastOperation)
-                    SetResult(() => (TResult?)operationResult);
+                {
+                    object? finalOperationResult = operationResult;
+                    SetResult(() => (TResult?)finalOperationResult);
+                }
 
                 var elapsed = Stopwatch.GetElapsedTime(startTimestamp);
-                PipelineOperationDurationMs.Record(elapsed.TotalMilliseconds);
+                PipelineTelemetry.PipelineOperationDurationMs.Record(elapsed.TotalMilliseconds);
                 operationActivity?.SetTag("pipeline.operation.duration.ms", elapsed.TotalMilliseconds);
 
                 LogOperationFinish(operation.Name, elapsed);
@@ -442,5 +449,12 @@ public sealed class OperationPipeline<TParam, TResult>
         }
 
         return runContext.ResultFactory!();
+    }
+
+    private sealed class RunContext(TParam parameter, Func<TResult?>? resultFactory)
+    {
+        public TParam Parameter { get; } = parameter;
+
+        public Func<TResult?>? ResultFactory { get; set; } = resultFactory;
     }
 }

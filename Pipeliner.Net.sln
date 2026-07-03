@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.8.34525.116
+# Visual Studio Version 18
+VisualStudioVersion = 18.5.11709.299 stable
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Pipeliner.Net", "Pipeliner.Net\Pipeliner.Net.csproj", "{39BFC12F-296B-467D-9A1B-D930D6AD7CA0}"
 EndProject
@@ -18,6 +18,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "workflows", "workflows", "{
 		.github\workflows\release.yml = .github\workflows\release.yml
 	EndProjectSection
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Pipeliner.Net.Benchmarks", "Pipeliner.Net.Benchmarks\Pipeliner.Net.Benchmarks.csproj", "{B8FEDD4E-B50D-7034-0589-D8A838BB9B38}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -32,6 +34,10 @@ Global
 		{9B319675-00F2-4B65-82F4-F8A89D3FFFBC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9B319675-00F2-4B65-82F4-F8A89D3FFFBC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{9B319675-00F2-4B65-82F4-F8A89D3FFFBC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B8FEDD4E-B50D-7034-0589-D8A838BB9B38}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B8FEDD4E-B50D-7034-0589-D8A838BB9B38}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B8FEDD4E-B50D-7034-0589-D8A838BB9B38}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B8FEDD4E-B50D-7034-0589-D8A838BB9B38}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

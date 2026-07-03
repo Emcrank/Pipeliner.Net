@@ -16,7 +16,7 @@ public partial class OperationPipelineTests
             .Build();
 
         // Act
-        var result = await pipeline.RunAsync(20);
+        int result = await pipeline.RunAsync(20);
 
         // Assert
         Assert.Equal(21, result);
@@ -32,7 +32,7 @@ public partial class OperationPipelineTests
             .Build();
 
         // Act
-        var result = await pipeline.RunAsync(3);
+        int result = await pipeline.RunAsync(3);
 
         // Assert
         Assert.Equal(2, result);
@@ -42,7 +42,7 @@ public partial class OperationPipelineTests
     public async Task RunAsyncThenAsyncWithStepPolicyRetriesStep()
     {
         // Arrange
-        var executionCount = 0;
+        int executionCount = 0;
 
         var pipeline = Pipeline
             .For<int>()
@@ -61,7 +61,7 @@ public partial class OperationPipelineTests
             .Build();
 
         // Act
-        var result = await pipeline.RunAsync(10);
+        int result = await pipeline.RunAsync(10);
 
         // Assert
         Assert.Equal(11, result);
@@ -82,7 +82,7 @@ public partial class OperationPipelineTests
             .Build();
 
         // Act
-        var result = await pipeline.RunAsync(10);
+        int result = await pipeline.RunAsync(10);
 
         // Assert
         Assert.Equal(24, result);
@@ -123,7 +123,7 @@ public partial class OperationPipelineTests
             .Build();
 
         // Act
-        var result = await pipeline.RunAsync(10);
+        int result = await pipeline.RunAsync(10);
 
         // Assert
         Assert.Equal(11, result);

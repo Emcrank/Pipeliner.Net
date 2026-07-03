@@ -16,4 +16,14 @@ public static class Pipeline
     /// <returns>A type-threaded builder instance.</returns>
     public static PipelineBuilder<TInput, TInput> For<TInput>(ILogger? logger = null) =>
         new((input, _) => ValueTask.FromResult(input), logger);
+
+    /// <summary>
+    /// Creates a channel-backed stream builder starting with <typeparamref name="TInput" /> as both input and current output
+    /// type.
+    /// </summary>
+    /// <typeparam name="TInput">The stream input type.</typeparam>
+    /// <param name="logger">Optional logger used by the built stream pipeline.</param>
+    /// <returns>A stream pipeline builder instance.</returns>
+    public static StreamPipelineBuilder<TInput, TInput> StreamFor<TInput>(ILogger? logger = null) =>
+        new((input, _) => ValueTask.FromResult(input), logger, BackpressureOptions.Default());
 }

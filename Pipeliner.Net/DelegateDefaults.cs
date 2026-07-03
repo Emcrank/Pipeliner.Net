@@ -13,7 +13,7 @@ internal static class DelegateDefaults
     internal static class CanExecute
     {
         /// <summary>
-        /// Gets a delegate that always returns <see langword="true"/>.
+        /// Gets a delegate that always returns <see langword="true" />.
         /// </summary>
         internal static Func<bool> Always { get; } = () => true;
     }
