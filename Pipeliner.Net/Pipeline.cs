@@ -15,7 +15,7 @@ public static class Pipeline
     /// <param name="logger">Optional logger used by the built pipeline.</param>
     /// <returns>A type-threaded builder instance.</returns>
     public static PipelineBuilder<TInput, TInput> For<TInput>(ILogger? logger = null) =>
-        new((input, _) => ValueTask.FromResult(input), logger);
+        new((input, _) => ValueTask.FromResult(input), logger, PipelineGraph.Create(typeof(TInput)));
 
     /// <summary>
     /// Creates a channel-backed stream builder starting with <typeparamref name="TInput" /> as both input and current output
@@ -25,5 +25,9 @@ public static class Pipeline
     /// <param name="logger">Optional logger used by the built stream pipeline.</param>
     /// <returns>A stream pipeline builder instance.</returns>
     public static StreamPipelineBuilder<TInput, TInput> StreamFor<TInput>(ILogger? logger = null) =>
-        new((input, _) => ValueTask.FromResult(input), logger, BackpressureOptions.Default());
+        new(
+            (input, _) => ValueTask.FromResult(input),
+            logger,
+            BackpressureOptions.Default(),
+            PipelineGraph.Create(typeof(TInput)));
 }

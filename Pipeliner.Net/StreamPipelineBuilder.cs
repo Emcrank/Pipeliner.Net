@@ -13,6 +13,7 @@ namespace Pipeliner.Net;
 public sealed class StreamPipelineBuilder<TInput, TCurrent>
 {
     private readonly Func<TInput, CancellationToken, ValueTask<TCurrent>> chain;
+    private readonly PipelineGraph graph;
     private readonly ILogger? logger;
     private readonly BackpressureOptions options;
 
@@ -22,17 +23,21 @@ public sealed class StreamPipelineBuilder<TInput, TCurrent>
     /// <param name="chain">The stream execution chain.</param>
     /// <param name="logger">The optional logger used by built stream pipelines.</param>
     /// <param name="options">The backpressure options for stream execution.</param>
+    /// <param name="graph">The pipeline definition graph.</param>
     internal StreamPipelineBuilder(
         Func<TInput, CancellationToken, ValueTask<TCurrent>> chain,
         ILogger? logger,
-        BackpressureOptions options)
+        BackpressureOptions options,
+        PipelineGraph graph)
     {
         ArgumentNullException.ThrowIfNull(chain);
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(graph);
 
         this.chain = chain;
         this.logger = logger;
         this.options = options;
+        this.graph = graph;
     }
 
     /// <summary>
@@ -40,11 +45,16 @@ public sealed class StreamPipelineBuilder<TInput, TCurrent>
     /// </summary>
     /// <param name="pipelineName">The optional pipeline name.</param>
     /// <returns>The built stream pipeline.</returns>
-    public StreamPipeline<TInput, TCurrent> Build(string? pipelineName = null) =>
-        new(chain, logger, options)
+    public StreamPipeline<TInput, TCurrent> Build(string? pipelineName = null)
+    {
+        var pipeline = new StreamPipeline<TInput, TCurrent>(chain, logger, options)
         {
             Name = string.IsNullOrWhiteSpace(pipelineName) ? "Unnamed_Stream_Pipeline" : pipelineName
         };
+
+        pipeline.SetDefinition(graph.ToDefinition(pipeline.Id, pipeline.Name));
+        return pipeline;
+    }
 
     /// <summary>
     /// Appends a synchronous stream step.
@@ -52,7 +62,17 @@ public sealed class StreamPipelineBuilder<TInput, TCurrent>
     /// <typeparam name="TNext">The next stream item type.</typeparam>
     /// <param name="step">The synchronous stream step.</param>
     /// <returns>A new stream builder with the updated output type.</returns>
-    public StreamPipelineBuilder<TInput, TNext> Then<TNext>(Func<TCurrent, TNext> step)
+    public StreamPipelineBuilder<TInput, TNext> Then<TNext>(Func<TCurrent, TNext> step) =>
+        Then(null, step);
+
+    /// <summary>
+    /// Appends a synchronous stream step.
+    /// </summary>
+    /// <typeparam name="TNext">The next stream item type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The synchronous stream step.</param>
+    /// <returns>A new stream builder with the updated output type.</returns>
+    public StreamPipelineBuilder<TInput, TNext> Then<TNext>(string? stepName, Func<TCurrent, TNext> step)
     {
         ArgumentNullException.ThrowIfNull(step);
 
@@ -63,7 +83,8 @@ public sealed class StreamPipelineBuilder<TInput, TCurrent>
                 return step(currentValue);
             },
             logger,
-            options);
+            options,
+            graph.AddStep(stepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Step));
     }
 
     /// <summary>
@@ -73,6 +94,18 @@ public sealed class StreamPipelineBuilder<TInput, TCurrent>
     /// <param name="step">The asynchronous stream step.</param>
     /// <returns>A new stream builder with the updated output type.</returns>
     public StreamPipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
+        ThenAsync(null, step);
+
+    /// <summary>
+    /// Appends an asynchronous stream step.
+    /// </summary>
+    /// <typeparam name="TNext">The next stream item type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The asynchronous stream step.</param>
+    /// <returns>A new stream builder with the updated output type.</returns>
+    public StreamPipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        string? stepName,
         Func<TCurrent, CancellationToken, ValueTask<TNext>> step)
     {
         ArgumentNullException.ThrowIfNull(step);
@@ -84,7 +117,8 @@ public sealed class StreamPipelineBuilder<TInput, TCurrent>
                 return await step(currentValue, cancellationToken).ConfigureAwait(false);
             },
             logger,
-            options);
+            options,
+            graph.AddStep(stepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Step));
     }
 
     /// <summary>
@@ -99,6 +133,6 @@ public sealed class StreamPipelineBuilder<TInput, TCurrent>
         if (backpressureOptions.Capacity <= 0)
             throw new ArgumentOutOfRangeException(nameof(backpressureOptions), "Capacity must be greater than zero.");
 
-        return new StreamPipelineBuilder<TInput, TCurrent>(chain, logger, backpressureOptions);
+        return new StreamPipelineBuilder<TInput, TCurrent>(chain, logger, backpressureOptions, graph);
     }
 }

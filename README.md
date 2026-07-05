@@ -350,6 +350,32 @@ public sealed class MyServiceStep(MyService service) : IPipelineStep<int, int>
 }
 ```
 
+
+## Pipeline descriptions and visualization
+
+Built pipelines expose structural metadata through `Describe()`. Named overloads make exported graphs readable for documentation, diagnostics, or UI rendering.
+
+```csharp
+var pipeline = Pipeline
+    .For<Order>()
+    .Then("Validate", ValidateOrder)
+    .ThenAsync("Price", PriceOrderAsync)
+    .Branch(
+        "Route by risk",
+        order => order.RiskScore > 80,
+        high => high with { ReviewRequired = true },
+        low => low)
+    .Build("Order workflow");
+
+var definition = pipeline.Describe();
+
+string mermaid = definition.ToMermaid();
+string dot = definition.ToDot();
+string json = definition.ToJson();
+```
+
+`PipelineDefinition` contains nodes, edges, node kinds, and input/output types. Stream pipelines expose the same `Describe()` API.
+
 ## Observability
 
 `OperationPipeline` emits:

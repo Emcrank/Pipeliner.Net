@@ -17,6 +17,7 @@ namespace Pipeliner.Net;
 public sealed class StreamPipeline<TInput, TOutput>
 {
     private readonly Func<TInput, CancellationToken, ValueTask<TOutput>> chain;
+    private PipelineDefinition? definition;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="StreamPipeline{TInput,TOutput}" /> class.
@@ -38,9 +39,23 @@ public sealed class StreamPipeline<TInput, TOutput>
     }
 
     /// <summary>
+    /// Gets or sets the unique stream pipeline identifier.
+    /// </summary>
+    public string Id { get; internal set; } = Guid.NewGuid().ToString("D");
+
+    /// <summary>
     /// Gets or sets the friendly stream pipeline name.
     /// </summary>
     public string Name { get; internal set; } = "Unnamed_Stream_Pipeline";
+
+    /// <summary>
+    /// Gets a structural description of this stream pipeline.
+    /// </summary>
+    /// <returns>The pipeline definition graph.</returns>
+    public PipelineDefinition Describe() => definition ??= PipelineGraph
+        .Create(typeof(TInput))
+        .AddStep("Result", typeof(TInput), typeof(TOutput), PipelineNodeKind.Step)
+        .ToDefinition(Id, Name);
 
     /// <summary>
     /// Gets the configured backpressure options.
@@ -90,6 +105,12 @@ public sealed class StreamPipeline<TInput, TOutput>
             channel.Writer.TryComplete();
             await AwaitProducerCompletionAsync(producerTask, cancellationToken, suppressCancellationException: true).ConfigureAwait(false);
         }
+    }
+
+    internal void SetDefinition(PipelineDefinition pipelineDefinition)
+    {
+        ArgumentNullException.ThrowIfNull(pipelineDefinition);
+        definition = pipelineDefinition;
     }
 
     private static async Task AwaitProducerCompletionAsync(
