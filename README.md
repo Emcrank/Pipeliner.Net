@@ -168,7 +168,30 @@ var pipeline = Pipeline
 ```
 
 If a later step fails, completed saga compensations run in reverse order. If compensation itself fails, `PipelineSagaCompensationException` exposes the original pipeline exception and all compensation failures.
-### 6) Pipeline-level execution policy
+### 6) Per-run state
+
+```csharp
+public sealed class OrderState
+{
+    public int Attempts { get; set; }
+    public DateTimeOffset? ValidatedAt { get; set; }
+}
+
+var pipeline = Pipeline
+    .For<Order>()
+    .WithState(() => new OrderState())
+    .ThenAsync("Validate", async (order, state, cancellationToken) =>
+    {
+        state.Attempts++;
+        state.ValidatedAt = DateTimeOffset.UtcNow;
+        return await ValidateAsync(order, cancellationToken);
+    })
+    .Then("Apply state", (order, state) => order with { Attempts = state.Attempts })
+    .Build("Stateful order workflow");
+```
+
+State is created once per pipeline run, so concurrent executions do not share mutable state.
+### 7) Pipeline-level execution policy
 
 ```csharp
 var pipeline = Pipeline
@@ -178,7 +201,7 @@ var pipeline = Pipeline
     .Build();
 ```
 
-### 7) Branch and branch async
+### 8) Branch and branch async
 
 ```csharp
 var pipeline = Pipeline
@@ -197,7 +220,7 @@ var label = await pipeline.RunAsync(150);
 // large:150
 ```
 
-### 8) Fork + merge (custom reducer)
+### 9) Fork + merge (custom reducer)
 
 ```csharp
 var pipeline = Pipeline
@@ -214,7 +237,7 @@ Console.WriteLine(finalPrice);
 // 371.6
 ```
 
-### 9) Built-in merge strategy: throw on any failure
+### 10) Built-in merge strategy: throw on any failure
 
 ```csharp
 var pipeline = Pipeline
@@ -231,7 +254,7 @@ var pipeline = Pipeline
 await Assert.ThrowsAsync<AggregateException>(() => pipeline.RunAsync(10));
 ```
 
-### 10) Built-in merge strategy: ignore failures
+### 11) Built-in merge strategy: ignore failures
 
 ```csharp
 var pipeline = Pipeline
@@ -249,7 +272,7 @@ var results = await pipeline.RunAsync(10);
 // [11, 13]
 ```
 
-### 11) Built-in merge strategy: take first
+### 12) Built-in merge strategy: take first
 
 ```csharp
 var pipeline = Pipeline
@@ -266,7 +289,7 @@ var first = await pipeline.RunAsync(10);
 // 11
 ```
 
-### 12) Parallel projection
+### 13) Parallel projection
 
 ```csharp
 var pipeline = Pipeline

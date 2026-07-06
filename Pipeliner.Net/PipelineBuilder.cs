@@ -528,6 +528,22 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     }
 
     /// <summary>
+    /// Adds per-run state to the pipeline builder.
+    /// </summary>
+    /// <typeparam name="TState">The per-run state type.</typeparam>
+    /// <param name="stateFactory">Factory used to create state for each pipeline run.</param>
+    /// <returns>A stateful pipeline builder.</returns>
+    public StatefulPipelineBuilder<TInput, TCurrent, TState> WithState<TState>(Func<TState> stateFactory)
+    {
+        ArgumentNullException.ThrowIfNull(stateFactory);
+
+        return new StatefulPipelineBuilder<TInput, TCurrent, TState>(
+            async (input, _, cancellationToken) => await chain(input, cancellationToken).ConfigureAwait(false),
+            logger,
+            graph,
+            stateFactory);
+    }
+    /// <summary>
     /// Adds an execution policy around the existing chain.
     /// </summary>
     /// <param name="policy">The policy to apply.</param>
