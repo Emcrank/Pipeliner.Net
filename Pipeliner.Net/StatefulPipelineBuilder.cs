@@ -146,7 +146,16 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
             async (input, state, cancellationToken) =>
             {
                 var currentValue = await chain(input, state, cancellationToken).ConfigureAwait(false);
-                return await ExecuteWithConcurrencyAsync(currentValue, state, cancellationToken).ConfigureAwait(false);
+                var traceContext = PipelineTraceContext.Current;
+                if (traceContext is null)
+                    return await ExecuteWithConcurrencyAsync(currentValue, state, cancellationToken).ConfigureAwait(false);
+
+                return await traceContext.TraceStepAsync(
+                    effectiveStepName ?? PipelineNodeKind.Step.ToString(),
+                    PipelineNodeKind.Step,
+                    typeof(TCurrent),
+                    typeof(TNext),
+                    () => ExecuteWithConcurrencyAsync(currentValue, state, cancellationToken)).ConfigureAwait(false);
             },
             logger,
             graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Step),

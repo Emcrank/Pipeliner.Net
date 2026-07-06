@@ -170,6 +170,24 @@ public sealed class OperationPipeline<TParam, TResult>
     }
 
     /// <summary>
+    /// Executes the pipeline synchronously and captures step trace metadata.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <returns>The pipeline result with trace metadata.</returns>
+    public PipelineRunResult<TResult?> RunWithTrace(TParam parameter) =>
+        PipelineTraceContext.Run(() => Run(parameter));
+
+    /// <summary>
+    /// Executes the pipeline asynchronously and captures step trace metadata.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The pipeline result with trace metadata.</returns>
+    public Task<PipelineRunResult<TResult?>> RunWithTraceAsync(
+        TParam parameter,
+        CancellationToken cancellationToken = default) =>
+        PipelineTraceContext.RunAsync(() => RunAsync(parameter, cancellationToken));
+    /// <summary>
     /// Executes the configured pipeline for each input item from an asynchronous source.
     /// </summary>
     /// <param name="parameters">The asynchronous input stream.</param>

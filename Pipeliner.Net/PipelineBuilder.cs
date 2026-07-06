@@ -576,7 +576,16 @@ public sealed class PipelineBuilder<TInput, TCurrent>
             async (input, cancellationToken) =>
             {
                 var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
-                return await ExecuteWithConcurrencyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+                var traceContext = PipelineTraceContext.Current;
+                if (traceContext is null)
+                    return await ExecuteWithConcurrencyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+                return await traceContext.TraceStepAsync(
+                    effectiveStepName ?? nodeKind.ToString(),
+                    nodeKind,
+                    typeof(TCurrent),
+                    typeof(TNext),
+                    () => ExecuteWithConcurrencyAsync(currentValue, cancellationToken)).ConfigureAwait(false);
             },
             logger,
             graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), nodeKind));

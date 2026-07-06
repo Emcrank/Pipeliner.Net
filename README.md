@@ -465,6 +465,22 @@ string json = definition.ToJson();
 
 `PipelineDefinition` contains nodes, edges, node kinds, and input/output types. Stream pipelines expose the same `Describe()` API.
 
+## Step tracing
+
+Use `RunWithTrace(...)` or `RunWithTraceAsync(...)` to execute a pipeline and capture per-step timing metadata for fluent steps.
+
+```csharp
+var run = await pipeline.RunWithTraceAsync(input, cancellationToken);
+
+Console.WriteLine(run.Result);
+
+foreach (var step in run.Trace.Steps)
+{
+    Console.WriteLine($"{step.Name}: {step.Duration.TotalMilliseconds}ms");
+}
+```
+
+Trace entries include the step name, kind, input/output types, duration, success flag, and exception type when captured around a failing step.
 ## Dry-run validation
 
 Use `DryRun()` to validate the captured pipeline structure without executing any step delegates or side effects.
