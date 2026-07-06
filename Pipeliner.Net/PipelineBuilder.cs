@@ -505,19 +505,58 @@ public sealed class PipelineBuilder<TInput, TCurrent>
         ArgumentNullException.ThrowIfNull(step);
 
         var effectiveOptions = options ?? StepExecutionOptions.None();
+        var effectiveStepName = stepName ?? effectiveOptions.Name;
+        var concurrencyGate = effectiveOptions.MaxConcurrency is { } maxConcurrency
+            ? new SemaphoreSlim(maxConcurrency, maxConcurrency)
+            : null;
 
         return new PipelineBuilder<TInput, TNext>(
             async (input, cancellationToken) =>
             {
                 var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
-
-                if (effectiveOptions.Policy is { } policy)
-                    return await policy.ExecuteAsync(token => step(currentValue, token), cancellationToken)
-                        .ConfigureAwait(false);
-
-                return await step(currentValue, cancellationToken).ConfigureAwait(false);
+                return await ExecuteWithConcurrencyAsync(currentValue, cancellationToken).ConfigureAwait(false);
             },
             logger,
-            graph.AddStep(stepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Step));
+            graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Step));
+
+        async ValueTask<TNext> ExecuteUserStepAsync(TCurrent currentValue, CancellationToken cancellationToken) =>
+            await step(currentValue, cancellationToken).ConfigureAwait(false);
+
+        async ValueTask<TNext> ExecuteWithPolicyAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            if (effectiveOptions.Policy is { } policy)
+                return await policy.ExecuteAsync(token => ExecuteUserStepAsync(currentValue, token), cancellationToken)
+                    .ConfigureAwait(false);
+
+            return await ExecuteUserStepAsync(currentValue, cancellationToken).ConfigureAwait(false);
+        }
+
+        async ValueTask<TNext> ExecuteWithRateLimitAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            if (effectiveOptions.RateLimiter is not { } rateLimiter)
+                return await ExecuteWithPolicyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+            using var lease = await rateLimiter.AcquireAsync(1, cancellationToken).ConfigureAwait(false);
+            if (!lease.IsAcquired)
+                throw new PipelineRateLimitRejectedException(effectiveStepName ?? "Unnamed step");
+
+            return await ExecuteWithPolicyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+        }
+
+        async ValueTask<TNext> ExecuteWithConcurrencyAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            if (concurrencyGate is null)
+                return await ExecuteWithRateLimitAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+            await concurrencyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await ExecuteWithRateLimitAsync(currentValue, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                concurrencyGate.Release();
+            }
+        }
     }
 }

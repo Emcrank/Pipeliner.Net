@@ -124,7 +124,34 @@ var pipeline = Pipeline
     .Build();
 ```
 
-### 4) Pipeline-level execution policy
+### 4) Step-level concurrency and rate limiting
+
+```csharp
+using System.Threading.RateLimiting;
+
+var limiter = new TokenBucketRateLimiter(
+    new TokenBucketRateLimiterOptions
+    {
+        TokenLimit = 100,
+        TokensPerPeriod = 100,
+        ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+        QueueLimit = 250,
+        AutoReplenishment = true
+    });
+
+var pipeline = Pipeline
+    .For<Order>()
+    .ThenAsync(
+        "Send to ERP",
+        SendToErpAsync,
+        StepExecutionOptions.Create(
+            maxConcurrency: 4,
+            rateLimiter: limiter))
+    .Build();
+```
+
+A rejected rate-limit lease throws `PipelineRateLimitRejectedException`.
+### 5) Pipeline-level execution policy
 
 ```csharp
 var pipeline = Pipeline
@@ -134,7 +161,7 @@ var pipeline = Pipeline
     .Build();
 ```
 
-### 5) Branch and branch async
+### 6) Branch and branch async
 
 ```csharp
 var pipeline = Pipeline
@@ -153,7 +180,7 @@ var label = await pipeline.RunAsync(150);
 // large:150
 ```
 
-### 6) Fork + merge (custom reducer)
+### 7) Fork + merge (custom reducer)
 
 ```csharp
 var pipeline = Pipeline
@@ -170,7 +197,7 @@ Console.WriteLine(finalPrice);
 // 371.6
 ```
 
-### 7) Built-in merge strategy: throw on any failure
+### 8) Built-in merge strategy: throw on any failure
 
 ```csharp
 var pipeline = Pipeline
@@ -187,7 +214,7 @@ var pipeline = Pipeline
 await Assert.ThrowsAsync<AggregateException>(() => pipeline.RunAsync(10));
 ```
 
-### 8) Built-in merge strategy: ignore failures
+### 9) Built-in merge strategy: ignore failures
 
 ```csharp
 var pipeline = Pipeline
@@ -205,7 +232,7 @@ var results = await pipeline.RunAsync(10);
 // [11, 13]
 ```
 
-### 9) Built-in merge strategy: take first
+### 10) Built-in merge strategy: take first
 
 ```csharp
 var pipeline = Pipeline
@@ -222,7 +249,7 @@ var first = await pipeline.RunAsync(10);
 // 11
 ```
 
-### 10) Parallel projection
+### 11) Parallel projection
 
 ```csharp
 var pipeline = Pipeline
