@@ -151,7 +151,24 @@ var pipeline = Pipeline
 ```
 
 A rejected rate-limit lease throws `PipelineRateLimitRejectedException`.
-### 5) Pipeline-level execution policy
+### 5) Saga compensation
+
+```csharp
+var pipeline = Pipeline
+    .For<CreateOrderCommand>()
+    .ThenSaga(
+        "Reserve inventory",
+        ReserveInventoryAsync,
+        (reservation, cancellationToken) => ReleaseInventoryAsync(reservation.Id, cancellationToken))
+    .ThenSaga(
+        "Capture payment",
+        CapturePaymentAsync,
+        (payment, cancellationToken) => RefundPaymentAsync(payment.Id, cancellationToken))
+    .Build("Create order");
+```
+
+If a later step fails, completed saga compensations run in reverse order. If compensation itself fails, `PipelineSagaCompensationException` exposes the original pipeline exception and all compensation failures.
+### 6) Pipeline-level execution policy
 
 ```csharp
 var pipeline = Pipeline
@@ -161,7 +178,7 @@ var pipeline = Pipeline
     .Build();
 ```
 
-### 6) Branch and branch async
+### 7) Branch and branch async
 
 ```csharp
 var pipeline = Pipeline
@@ -180,7 +197,7 @@ var label = await pipeline.RunAsync(150);
 // large:150
 ```
 
-### 7) Fork + merge (custom reducer)
+### 8) Fork + merge (custom reducer)
 
 ```csharp
 var pipeline = Pipeline
@@ -197,7 +214,7 @@ Console.WriteLine(finalPrice);
 // 371.6
 ```
 
-### 8) Built-in merge strategy: throw on any failure
+### 9) Built-in merge strategy: throw on any failure
 
 ```csharp
 var pipeline = Pipeline
@@ -214,7 +231,7 @@ var pipeline = Pipeline
 await Assert.ThrowsAsync<AggregateException>(() => pipeline.RunAsync(10));
 ```
 
-### 9) Built-in merge strategy: ignore failures
+### 10) Built-in merge strategy: ignore failures
 
 ```csharp
 var pipeline = Pipeline
@@ -232,7 +249,7 @@ var results = await pipeline.RunAsync(10);
 // [11, 13]
 ```
 
-### 10) Built-in merge strategy: take first
+### 11) Built-in merge strategy: take first
 
 ```csharp
 var pipeline = Pipeline
@@ -249,7 +266,7 @@ var first = await pipeline.RunAsync(10);
 // 11
 ```
 
-### 11) Parallel projection
+### 12) Parallel projection
 
 ```csharp
 var pipeline = Pipeline

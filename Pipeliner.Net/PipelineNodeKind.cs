@@ -56,6 +56,11 @@ public enum PipelineNodeKind
     Window,
 
     /// <summary>
+    /// A compensatable saga step.
+    /// </summary>
+    Saga,
+
+    /// <summary>
     /// An execution policy wrapper.
     /// </summary>
     Policy

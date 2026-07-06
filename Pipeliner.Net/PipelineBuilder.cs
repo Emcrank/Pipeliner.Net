@@ -131,7 +131,9 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     {
         var pipeline = new OperationPipeline<TInput, TCurrent>(logger)
             .AddOperation<TInput, TCurrent>(async (input, cancellationToken) =>
-                await chain(input, cancellationToken).ConfigureAwait(false));
+                await PipelineSagaContext.RunAsync(
+                    token => chain(input, token),
+                    cancellationToken).ConfigureAwait(false));
 
         if (!string.IsNullOrWhiteSpace(pipelineName))
             pipeline.Name = pipelineName;
@@ -371,6 +373,49 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     }
 
     /// <summary>
+    /// Appends a compensatable saga step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="execute">The step execution delegate.</param>
+    /// <param name="compensate">The compensation callback registered after successful execution.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenSaga<TNext>(
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> execute,
+        Func<TNext, CancellationToken, ValueTask> compensate,
+        StepExecutionOptions? options = null) =>
+        ThenSaga(null, execute, compensate, options);
+
+    /// <summary>
+    /// Appends a compensatable saga step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="execute">The step execution delegate.</param>
+    /// <param name="compensate">The compensation callback registered after successful execution.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenSaga<TNext>(
+        string? stepName,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> execute,
+        Func<TNext, CancellationToken, ValueTask> compensate,
+        StepExecutionOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(execute);
+        ArgumentNullException.ThrowIfNull(compensate);
+
+        return ThenAsyncCore(
+            stepName,
+            async (current, cancellationToken) =>
+            {
+                var result = await execute(current, cancellationToken).ConfigureAwait(false);
+                PipelineSagaContext.Current?.Register(token => compensate(result, token));
+                return result;
+            },
+            options,
+            PipelineNodeKind.Saga);
+    }
+    /// <summary>
     /// Appends an asynchronous step to the builder.
     /// </summary>
     /// <typeparam name="TNext">The next output type.</typeparam>
@@ -500,7 +545,8 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     private PipelineBuilder<TInput, TNext> ThenAsyncCore<TNext>(
         string? stepName,
         Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
-        StepExecutionOptions? options)
+        StepExecutionOptions? options,
+        PipelineNodeKind nodeKind = PipelineNodeKind.Step)
     {
         ArgumentNullException.ThrowIfNull(step);
 
@@ -517,7 +563,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                 return await ExecuteWithConcurrencyAsync(currentValue, cancellationToken).ConfigureAwait(false);
             },
             logger,
-            graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Step));
+            graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), nodeKind));
 
         async ValueTask<TNext> ExecuteUserStepAsync(TCurrent currentValue, CancellationToken cancellationToken) =>
             await step(currentValue, cancellationToken).ConfigureAwait(false);
