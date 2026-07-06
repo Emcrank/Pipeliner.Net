@@ -50,6 +50,12 @@ public sealed class OperationPipeline<TParam, TResult>
         .ToDefinition(Id, Name);
 
     /// <summary>
+    /// Validates the pipeline definition without executing pipeline steps.
+    /// </summary>
+    /// <returns>A dry-run validation report.</returns>
+    public PipelineDryRunReport DryRun() => PipelineDryRunReport.Validate(Describe());
+
+    /// <summary>
     /// Gets the logger used by this pipeline.
     /// </summary>
     private ILogger? Logger { get; }

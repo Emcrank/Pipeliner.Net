@@ -442,6 +442,23 @@ string json = definition.ToJson();
 
 `PipelineDefinition` contains nodes, edges, node kinds, and input/output types. Stream pipelines expose the same `Describe()` API.
 
+## Dry-run validation
+
+Use `DryRun()` to validate the captured pipeline structure without executing any step delegates or side effects.
+
+```csharp
+var report = pipeline.DryRun();
+
+if (!report.IsValid)
+{
+    foreach (var issue in report.Issues)
+    {
+        Console.WriteLine($"{issue.Severity}: {issue.Code} - {issue.Message}");
+    }
+}
+```
+
+Dry-run validation checks graph consistency, missing edge endpoints, duplicate node IDs, and unreachable nodes.
 ## Observability
 
 `OperationPipeline` emits:

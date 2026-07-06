@@ -58,6 +58,12 @@ public sealed class StreamPipeline<TInput, TOutput>
         .ToDefinition(Id, Name);
 
     /// <summary>
+    /// Validates the stream pipeline definition without executing pipeline steps.
+    /// </summary>
+    /// <returns>A dry-run validation report.</returns>
+    public PipelineDryRunReport DryRun() => PipelineDryRunReport.Validate(Describe());
+
+    /// <summary>
     /// Gets the configured backpressure options.
     /// </summary>
     public BackpressureOptions BackpressureOptions { get; }
