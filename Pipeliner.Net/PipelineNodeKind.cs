@@ -46,6 +46,16 @@ public enum PipelineNodeKind
     Parallel,
 
     /// <summary>
+    /// A count or time based batching step.
+    /// </summary>
+    Batch,
+
+    /// <summary>
+    /// A time based windowing step.
+    /// </summary>
+    Window,
+
+    /// <summary>
     /// An execution policy wrapper.
     /// </summary>
     Policy

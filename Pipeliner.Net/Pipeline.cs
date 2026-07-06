@@ -26,7 +26,7 @@ public static class Pipeline
     /// <returns>A stream pipeline builder instance.</returns>
     public static StreamPipelineBuilder<TInput, TInput> StreamFor<TInput>(ILogger? logger = null) =>
         new(
-            (input, _) => ValueTask.FromResult(input),
+            (source, _) => source,
             logger,
             BackpressureOptions.Default(),
             PipelineGraph.Create(typeof(TInput)));

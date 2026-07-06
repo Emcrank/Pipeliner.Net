@@ -16,24 +16,24 @@ namespace Pipeliner.Net;
 /// <typeparam name="TOutput">The stream output item type.</typeparam>
 public sealed class StreamPipeline<TInput, TOutput>
 {
-    private readonly Func<TInput, CancellationToken, ValueTask<TOutput>> chain;
+    private readonly Func<IAsyncEnumerable<TInput>, CancellationToken, IAsyncEnumerable<TOutput>> transform;
     private PipelineDefinition? definition;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="StreamPipeline{TInput,TOutput}" /> class.
     /// </summary>
-    /// <param name="chain">The stream execution chain.</param>
+    /// <param name="transform">The stream execution transform.</param>
     /// <param name="logger">The optional logger used by stream execution.</param>
     /// <param name="backpressureOptions">The backpressure options.</param>
     internal StreamPipeline(
-        Func<TInput, CancellationToken, ValueTask<TOutput>> chain,
+        Func<IAsyncEnumerable<TInput>, CancellationToken, IAsyncEnumerable<TOutput>> transform,
         ILogger? logger,
         BackpressureOptions backpressureOptions)
     {
-        ArgumentNullException.ThrowIfNull(chain);
+        ArgumentNullException.ThrowIfNull(transform);
         ArgumentNullException.ThrowIfNull(backpressureOptions);
 
-        this.chain = chain;
+        this.transform = transform;
         Logger = logger;
         BackpressureOptions = backpressureOptions;
     }
@@ -92,10 +92,11 @@ public sealed class StreamPipeline<TInput, TOutput>
 
         try
         {
-            await foreach (var item in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            var transformedItems = transform(channel.Reader.ReadAllAsync(cancellationToken), cancellationToken);
+            await foreach (var item in transformedItems.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                yield return await chain(item, cancellationToken).ConfigureAwait(false);
+                yield return item;
             }
 
             await AwaitProducerCompletionAsync(producerTask, cancellationToken, suppressCancellationException: false).ConfigureAwait(false);

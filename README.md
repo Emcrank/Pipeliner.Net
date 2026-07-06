@@ -331,6 +331,28 @@ var streamPipeline = Pipeline
     .Build();
 ```
 
+### Batch and window stream items
+
+```csharp
+var batchedPipeline = Pipeline
+    .StreamFor<OrderCreated>()
+    .Batch(size: 100, maxDelay: TimeSpan.FromSeconds(5))
+    .ThenAsync<ImportResult>(ImportBatchAsync)
+    .Build("Order import batches");
+
+await foreach (var result in batchedPipeline.RunStreamAsync(events, cancellationToken))
+{
+    Console.WriteLine(result.ImportedCount);
+}
+```
+
+```csharp
+var windowedPipeline = Pipeline
+    .StreamFor<MetricPoint>()
+    .Window(TimeSpan.FromSeconds(10))
+    .Then(window => window.Average(point => point.Value))
+    .Build("Metric windows");
+```
 Available backpressure modes:
 
 - `BackpressureMode.Wait`
