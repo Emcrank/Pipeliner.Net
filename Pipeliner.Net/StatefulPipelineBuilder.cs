@@ -14,6 +14,7 @@ namespace Pipeliner.Net;
 public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
 {
     private readonly Func<TInput, TState, CancellationToken, ValueTask<TCurrent>> chain;
+    private readonly PipelineCheckpointOptions? checkpointOptions;
     private readonly PipelineGraph graph;
     private readonly ILogger? logger;
     private readonly Func<TState> stateFactory;
@@ -22,7 +23,8 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
         Func<TInput, TState, CancellationToken, ValueTask<TCurrent>> chain,
         ILogger? logger,
         PipelineGraph graph,
-        Func<TState> stateFactory)
+        Func<TState> stateFactory,
+        PipelineCheckpointOptions? checkpointOptions = null)
     {
         ArgumentNullException.ThrowIfNull(chain);
         ArgumentNullException.ThrowIfNull(graph);
@@ -32,6 +34,7 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
         this.logger = logger;
         this.graph = graph;
         this.stateFactory = stateFactory;
+        this.checkpointOptions = checkpointOptions;
     }
 
     /// <summary>
@@ -41,19 +44,29 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
     /// <returns>The built operation pipeline.</returns>
     public OperationPipeline<TInput, TCurrent> Build(string? pipelineName = null)
     {
-        var pipeline = new OperationPipeline<TInput, TCurrent>(logger)
-            .AddOperation<TInput, TCurrent>(async (input, cancellationToken) =>
-            {
-                var state = stateFactory();
-                ArgumentNullException.ThrowIfNull(state);
-
-                return await PipelineSagaContext.RunAsync(
-                    token => chain(input, state, token),
-                    cancellationToken).ConfigureAwait(false);
-            });
+        var pipeline = new OperationPipeline<TInput, TCurrent>(logger);
 
         if (!string.IsNullOrWhiteSpace(pipelineName))
             pipeline.Name = pipelineName;
+
+        pipeline.AddOperation<TInput, TCurrent>(async (input, cancellationToken) =>
+        {
+            var state = stateFactory();
+            ArgumentNullException.ThrowIfNull(state);
+
+            var executionContext = new PipelineExecutionContext(
+                Guid.NewGuid().ToString("D"),
+                pipeline.Id,
+                pipeline.Name,
+                checkpointOptions);
+
+            return await PipelineExecutionContext.RunAsync(
+                executionContext,
+                token => PipelineSagaContext.RunAsync(
+                    sagaToken => chain(input, state, sagaToken),
+                    token),
+                cancellationToken).ConfigureAwait(false);
+        });
 
         pipeline.SetDefinition(graph.ToDefinition(pipeline.Id, pipeline.Name));
         return pipeline;
@@ -110,6 +123,63 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
     }
 
     /// <summary>
+    /// Configures checkpoint persistence for this request-response pipeline.
+    /// </summary>
+    /// <param name="options">The checkpoint options.</param>
+    /// <returns>A new builder with checkpoint persistence configured.</returns>
+    public StatefulPipelineBuilder<TInput, TCurrent, TState> WithCheckpointing(PipelineCheckpointOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        return new StatefulPipelineBuilder<TInput, TCurrent, TState>(chain, logger, graph, stateFactory, options);
+    }
+
+    /// <summary>
+    /// Configures checkpoint persistence for this request-response pipeline.
+    /// </summary>
+    /// <param name="store">The checkpoint store.</param>
+    /// <param name="failureBehavior">The checkpoint persistence failure behavior.</param>
+    /// <returns>A new builder with checkpoint persistence configured.</returns>
+    public StatefulPipelineBuilder<TInput, TCurrent, TState> WithCheckpointing(
+        IPipelineCheckpointStore store,
+        PipelineCheckpointFailureBehavior failureBehavior = PipelineCheckpointFailureBehavior.FailRun)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+
+        return WithCheckpointing(new PipelineCheckpointOptions(store, failureBehavior: failureBehavior));
+    }
+
+    /// <summary>
+    /// Adds a durable checkpoint for the current value.
+    /// </summary>
+    /// <param name="checkpointName">The checkpoint display name.</param>
+    /// <returns>A new builder with a checkpoint identity step.</returns>
+    public StatefulPipelineBuilder<TInput, TCurrent, TState> Checkpoint(string checkpointName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(checkpointName);
+
+        var nextGraph = graph.AddStep(checkpointName, typeof(TCurrent), typeof(TCurrent), PipelineNodeKind.Checkpoint);
+        var checkpointNode = nextGraph.TerminalNode;
+
+        return new StatefulPipelineBuilder<TInput, TCurrent, TState>(
+            async (input, state, cancellationToken) =>
+            {
+                var current = await chain(input, state, cancellationToken).ConfigureAwait(false);
+                if (PipelineExecutionContext.Current is { } context)
+                {
+                    await context.SaveCheckpointAsync(checkpointName, checkpointNode.Id, current, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                return current;
+            },
+            logger,
+            nextGraph,
+            stateFactory,
+            checkpointOptions);
+    }
+
+    /// <summary>
     /// Appends an asynchronous state-aware step to the builder.
     /// </summary>
     /// <typeparam name="TNext">The next output type.</typeparam>
@@ -159,12 +229,19 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
             },
             logger,
             graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Step),
-            stateFactory);
+            stateFactory,
+            checkpointOptions);
 
-        async ValueTask<TNext> ExecuteUserStepAsync(TCurrent currentValue, TState state, CancellationToken cancellationToken) =>
+        async ValueTask<TNext> ExecuteUserStepAsync(
+            TCurrent currentValue,
+            TState state,
+            CancellationToken cancellationToken) =>
             await step(currentValue, state, cancellationToken).ConfigureAwait(false);
 
-        async ValueTask<TNext> ExecuteWithPolicyAsync(TCurrent currentValue, TState state, CancellationToken cancellationToken)
+        async ValueTask<TNext> ExecuteWithPolicyAsync(
+            TCurrent currentValue,
+            TState state,
+            CancellationToken cancellationToken)
         {
             if (effectiveOptions.Policy is { } policy)
                 return await policy.ExecuteAsync(token => ExecuteUserStepAsync(currentValue, state, token), cancellationToken)
@@ -173,7 +250,10 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
             return await ExecuteUserStepAsync(currentValue, state, cancellationToken).ConfigureAwait(false);
         }
 
-        async ValueTask<TNext> ExecuteWithRateLimitAsync(TCurrent currentValue, TState state, CancellationToken cancellationToken)
+        async ValueTask<TNext> ExecuteWithRateLimitAsync(
+            TCurrent currentValue,
+            TState state,
+            CancellationToken cancellationToken)
         {
             if (effectiveOptions.RateLimiter is not { } rateLimiter)
                 return await ExecuteWithPolicyAsync(currentValue, state, cancellationToken).ConfigureAwait(false);
@@ -185,7 +265,10 @@ public sealed class StatefulPipelineBuilder<TInput, TCurrent, TState>
             return await ExecuteWithPolicyAsync(currentValue, state, cancellationToken).ConfigureAwait(false);
         }
 
-        async ValueTask<TNext> ExecuteWithConcurrencyAsync(TCurrent currentValue, TState state, CancellationToken cancellationToken)
+        async ValueTask<TNext> ExecuteWithConcurrencyAsync(
+            TCurrent currentValue,
+            TState state,
+            CancellationToken cancellationToken)
         {
             if (concurrencyGate is null)
                 return await ExecuteWithRateLimitAsync(currentValue, state, cancellationToken).ConfigureAwait(false);

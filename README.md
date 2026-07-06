@@ -151,6 +151,7 @@ var pipeline = Pipeline
 ```
 
 A rejected rate-limit lease throws `PipelineRateLimitRejectedException`.
+
 ### 5) Saga compensation
 
 ```csharp
@@ -168,6 +169,7 @@ var pipeline = Pipeline
 ```
 
 If a later step fails, completed saga compensations run in reverse order. If compensation itself fails, `PipelineSagaCompensationException` exposes the original pipeline exception and all compensation failures.
+
 ### 6) Per-run state
 
 ```csharp
@@ -191,6 +193,7 @@ var pipeline = Pipeline
 ```
 
 State is created once per pipeline run, so concurrent executions do not share mutable state.
+
 ### 7) Pipeline-level execution policy
 
 ```csharp
@@ -217,6 +220,7 @@ var pipeline = Pipeline
 ```
 
 If no route matches and no default route is configured, `PipelineRouteNotFoundException` is thrown.
+
 ### 9) Branch and branch async
 
 ```csharp
@@ -356,6 +360,168 @@ await foreach (var item in pipeline.RunBatchAsync(GetInputsAsync()))
 }
 ```
 
+## Checkpoints and persistence
+
+Checkpoints let a request-response pipeline persist the current value at explicit points in the workflow. They are useful for debugging production failures, auditing important intermediate states, preserving expensive transformation results, and preparing for manual recovery scenarios.
+
+Checkpointing is opt-in:
+
+- add one or more `.Checkpoint(...)` calls,
+- configure persistence with `.WithCheckpointing(...)`,
+- make sure the value at each checkpoint can be serialized with `System.Text.Json`.
+
+Pipelines without checkpoints are unaffected. Only the value flowing through an explicit checkpoint needs to be JSON-serializable.
+
+Checkpointing is currently for `Pipeline.For<TInput>()` request-response pipelines. Stream pipelines are excluded from durable execution v1.
+
+### In-memory checkpoints
+
+`InMemoryPipelineCheckpointStore` is useful for tests, local diagnostics, and short-lived processes.
+
+```csharp
+var store = new InMemoryPipelineCheckpointStore();
+
+var pipeline = Pipeline
+    .For<string>()
+    .Then("Parse", int.Parse)
+    .Checkpoint("After parse")
+    .Then("Increment", value => value + 1)
+    .WithCheckpointing(store)
+    .Build("Checkpointed parse workflow");
+
+var result = await pipeline.RunAsync("41");
+// 42
+
+var checkpoints = await store.LoadByPipelineAsync(pipeline.Id);
+
+foreach (var checkpoint in checkpoints)
+{
+    Console.WriteLine($"{checkpoint.CheckpointName}: {checkpoint.PayloadJson}");
+}
+```
+
+### File-backed checkpoints
+
+`FilePipelineCheckpointStore` stores checkpoint records as JSON files.
+
+```csharp
+var store = new FilePipelineCheckpointStore("./checkpoints");
+
+var pipeline = Pipeline
+    .For<Order>()
+    .Then("Validate", ValidateOrder)
+    .Checkpoint("After validation")
+    .ThenAsync("Submit to ERP", SubmitToErpAsync)
+    .WithCheckpointing(store)
+    .Build("Order submission");
+
+await pipeline.RunAsync(order, cancellationToken);
+```
+
+Each saved checkpoint includes:
+
+- run ID,
+- pipeline ID and name,
+- checkpoint name,
+- checkpoint node ID,
+- payload type,
+- JSON payload,
+- creation timestamp.
+
+You can load checkpoints for a specific run or all checkpoints for a pipeline:
+
+```csharp
+IReadOnlyList<PipelineCheckpoint> runCheckpoints =
+    await store.LoadAsync(runId, cancellationToken);
+
+IReadOnlyList<PipelineCheckpoint> pipelineCheckpoints =
+    await store.LoadByPipelineAsync(pipeline.Id, cancellationToken);
+```
+
+### Checkpoint failure behavior
+
+Checkpoint persistence failures fail the pipeline run by default. This is the safest behavior for workflows where a checkpoint is part of the reliability contract.
+
+```csharp
+var pipeline = Pipeline
+    .For<Order>()
+    .Then("Validate", ValidateOrder)
+    .Checkpoint("After validation")
+    .WithCheckpointing(
+        store,
+        PipelineCheckpointFailureBehavior.FailRun)
+    .Build();
+```
+
+If checkpoint persistence is best-effort for your workflow, configure the pipeline to continue when checkpoint storage fails:
+
+```csharp
+var pipeline = Pipeline
+    .For<Order>()
+    .Then("Validate", ValidateOrder)
+    .Checkpoint("After validation")
+    .WithCheckpointing(
+        store,
+        PipelineCheckpointFailureBehavior.Continue)
+    .Build();
+```
+
+### Custom checkpoint stores
+
+Implement `IPipelineCheckpointStore` to persist checkpoints in a database, blob store, document database, queue, or another durable system.
+
+```csharp
+public sealed class SqlPipelineCheckpointStore : IPipelineCheckpointStore
+{
+    private readonly string connectionString;
+
+    public SqlPipelineCheckpointStore(string connectionString)
+    {
+        this.connectionString = connectionString;
+    }
+
+    public async ValueTask SaveAsync(
+        PipelineCheckpoint checkpoint,
+        CancellationToken cancellationToken = default)
+    {
+        // Insert checkpoint.RunId, checkpoint.PipelineId,
+        // checkpoint.CheckpointName, checkpoint.PayloadType,
+        // checkpoint.PayloadJson, and checkpoint.CreatedAt.
+        await SaveCheckpointRowAsync(connectionString, checkpoint, cancellationToken);
+    }
+
+    public async ValueTask<IReadOnlyList<PipelineCheckpoint>> LoadAsync(
+        string runId,
+        CancellationToken cancellationToken = default)
+    {
+        // Return all checkpoints for one pipeline run, ordered by creation time.
+        return await LoadCheckpointRowsForRunAsync(connectionString, runId, cancellationToken);
+    }
+
+    public async ValueTask<IReadOnlyList<PipelineCheckpoint>> LoadByPipelineAsync(
+        string pipelineId,
+        CancellationToken cancellationToken = default)
+    {
+        // Return all checkpoints for one pipeline definition, ordered by creation time.
+        return await LoadCheckpointRowsForPipelineAsync(connectionString, pipelineId, cancellationToken);
+    }
+}
+```
+
+Then use it like any built-in store:
+
+```csharp
+var store = new SqlPipelineCheckpointStore(connectionString);
+
+var pipeline = Pipeline
+    .For<OrderImport>()
+    .Then("Normalize", NormalizeImport)
+    .Checkpoint("After normalization")
+    .ThenAsync("Persist", PersistImportAsync)
+    .WithCheckpointing(PipelineCheckpointOptions.FailRun(store))
+    .Build("Import workflow");
+```
+
 ## Stream execution with backpressure
 
 ### Stream builder quick start
@@ -409,6 +575,7 @@ var windowedPipeline = Pipeline
     .Then(window => window.Average(point => point.Value))
     .Build("Metric windows");
 ```
+
 Available backpressure modes:
 
 - `BackpressureMode.Wait`
@@ -455,10 +622,19 @@ public sealed class MyServiceStep(MyService service) : IPipelineStep<int, int>
 }
 ```
 
-
 ## Pipeline descriptions and visualization
 
-Built pipelines expose structural metadata through `Describe()`. Named overloads make exported graphs readable for documentation, diagnostics, or UI rendering.
+Built pipelines expose structural metadata through `Describe()`. Named overloads make exported graphs readable for documentation, diagnostics, pull request notes, architecture diagrams, or UI rendering.
+
+`PipelineDefinition` contains:
+
+- pipeline ID and name,
+- graph nodes,
+- graph edges,
+- node kinds,
+- step input/output types.
+
+Request-response pipelines and stream pipelines both expose `Describe()`.
 
 ```csharp
 var pipeline = Pipeline
@@ -473,13 +649,107 @@ var pipeline = Pipeline
     .Build("Order workflow");
 
 var definition = pipeline.Describe();
-
-string mermaid = definition.ToMermaid();
-string dot = definition.ToDot();
-string json = definition.ToJson();
 ```
 
-`PipelineDefinition` contains nodes, edges, node kinds, and input/output types. Stream pipelines expose the same `Describe()` API.
+### Export as JSON
+
+Use `ToJson()` when you want to store, inspect, diff, or render the pipeline definition in another tool.
+
+```csharp
+string json = definition.ToJson();
+
+Console.WriteLine(json);
+```
+
+Example output:
+
+```json
+{
+  "id": "4f4e7b8f-2c2e-4f2f-9f5d-4b90f9f2c99f",
+  "name": "Order workflow",
+  "nodes": [
+    {
+      "id": "input",
+      "name": "Input",
+      "kind": "Input",
+      "inputType": "Order",
+      "outputType": "Order"
+    },
+    {
+      "id": "step_1",
+      "name": "Validate",
+      "kind": "Step",
+      "inputType": "Order",
+      "outputType": "ValidatedOrder"
+    }
+  ],
+  "edges": [
+    {
+      "from": "input",
+      "to": "step_1",
+      "label": null
+    }
+  ]
+}
+```
+
+You can pass custom `JsonSerializerOptions` if you want different formatting:
+
+```csharp
+string compactJson = definition.ToJson(
+    new JsonSerializerOptions { WriteIndented = false });
+```
+
+### Export as Mermaid
+
+Use `ToMermaid()` when you want Markdown-friendly diagrams for GitHub, documentation sites, or generated architecture notes.
+
+```csharp
+string mermaid = definition.ToMermaid();
+
+Console.WriteLine(mermaid);
+```
+
+Example output:
+
+```mermaid
+flowchart TD
+    input["Input<br/>Input<br/>Order -> Order"]
+    step_1["Validate<br/>Step<br/>Order -> ValidatedOrder"]
+    step_2["Price<br/>Step<br/>ValidatedOrder -> PricedOrder"]
+    input --> step_1
+    step_1 --> step_2
+```
+
+You can paste the generated Mermaid into Markdown renderers that support Mermaid diagrams.
+
+### Export as Graphviz DOT
+
+Use `ToDot()` when you want to render the pipeline graph with Graphviz or other tooling that understands DOT files.
+
+```csharp
+string dot = definition.ToDot();
+
+await File.WriteAllTextAsync("order-workflow.dot", dot, cancellationToken);
+```
+
+Example output:
+
+```dot
+digraph "Order workflow" {
+    "input" [label="Input\nInput\nOrder -> Order"];
+    "step_1" [label="Validate\nStep\nOrder -> ValidatedOrder"];
+    "step_2" [label="Price\nStep\nValidatedOrder -> PricedOrder"];
+    "input" -> "step_1";
+    "step_1" -> "step_2";
+}
+```
+
+A DOT file can be rendered with Graphviz:
+
+```bash
+dot -Tpng order-workflow.dot -o order-workflow.png
+```
 
 ## Step tracing
 
@@ -497,6 +767,7 @@ foreach (var step in run.Trace.Steps)
 ```
 
 Trace entries include the step name, kind, input/output types, duration, success flag, and exception type when captured around a failing step.
+
 ## Dry-run validation
 
 Use `DryRun()` to validate the captured pipeline structure without executing any step delegates or side effects.
@@ -514,6 +785,7 @@ if (!report.IsValid)
 ```
 
 Dry-run validation checks graph consistency, missing edge endpoints, duplicate node IDs, and unreachable nodes.
+
 ## Observability
 
 `OperationPipeline` emits:

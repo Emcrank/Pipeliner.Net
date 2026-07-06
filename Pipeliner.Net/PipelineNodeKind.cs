@@ -66,6 +66,11 @@ public enum PipelineNodeKind
     Saga,
 
     /// <summary>
+    /// A durable checkpoint persistence step.
+    /// </summary>
+    Checkpoint,
+
+    /// <summary>
     /// An execution policy wrapper.
     /// </summary>
     Policy

@@ -25,6 +25,20 @@ internal sealed class PipelineGraph
 
     private int NextNodeIndex { get; }
 
+    public PipelineNode TerminalNode
+    {
+        get
+        {
+            foreach (var node in Nodes)
+            {
+                if (node.Id == TerminalNodeId)
+                    return node;
+            }
+
+            throw new InvalidOperationException("Pipeline graph terminal node was not found.");
+        }
+    }
+
     public static PipelineGraph Create(Type inputType)
     {
         var inputNode = new PipelineNode("input", "Input", inputType, inputType, PipelineNodeKind.Input);
