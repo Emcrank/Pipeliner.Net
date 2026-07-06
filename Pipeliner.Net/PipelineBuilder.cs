@@ -15,6 +15,7 @@ namespace Pipeliner.Net;
 public sealed class PipelineBuilder<TInput, TCurrent>
 {
     private readonly Func<TInput, CancellationToken, ValueTask<TCurrent>> chain;
+    private readonly PipelineGraph graph;
     private readonly ILogger? logger;
 
     /// <summary>
@@ -22,14 +23,89 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// </summary>
     /// <param name="chain">The pipeline execution chain.</param>
     /// <param name="logger">The optional logger used by built pipelines.</param>
-    internal PipelineBuilder(Func<TInput, CancellationToken, ValueTask<TCurrent>> chain, ILogger? logger)
+    /// <param name="graph">The pipeline definition graph.</param>
+    internal PipelineBuilder(
+        Func<TInput, CancellationToken, ValueTask<TCurrent>> chain,
+        ILogger? logger,
+        PipelineGraph graph)
     {
         ArgumentNullException.ThrowIfNull(chain);
+        ArgumentNullException.ThrowIfNull(graph);
 
         this.chain = chain;
         this.logger = logger;
+        this.graph = graph;
     }
 
+    /// <summary>
+    /// Routes execution to a keyed route handler based on runtime data.
+    /// </summary>
+    /// <typeparam name="TKey">The route key type.</typeparam>
+    /// <typeparam name="TNext">The route output type.</typeparam>
+    /// <param name="routeSelector">The route key selector.</param>
+    /// <param name="configureRoutes">The route configuration callback.</param>
+    /// <returns>A new builder with the route output type.</returns>
+    public PipelineBuilder<TInput, TNext> RouteBy<TKey, TNext>(
+        Func<TCurrent, TKey> routeSelector,
+        Action<PipelineRouteBuilder<TCurrent, TKey, TNext>> configureRoutes)
+        where TKey : notnull =>
+        RouteBy(null, routeSelector, configureRoutes);
+
+    /// <summary>
+    /// Routes execution to a keyed route handler based on runtime data.
+    /// </summary>
+    /// <typeparam name="TKey">The route key type.</typeparam>
+    /// <typeparam name="TNext">The route output type.</typeparam>
+    /// <param name="stepName">The route display name used in pipeline descriptions.</param>
+    /// <param name="routeSelector">The route key selector.</param>
+    /// <param name="configureRoutes">The route configuration callback.</param>
+    /// <returns>A new builder with the route output type.</returns>
+    public PipelineBuilder<TInput, TNext> RouteBy<TKey, TNext>(
+        string? stepName,
+        Func<TCurrent, TKey> routeSelector,
+        Action<PipelineRouteBuilder<TCurrent, TKey, TNext>> configureRoutes)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(routeSelector);
+        ArgumentNullException.ThrowIfNull(configureRoutes);
+
+        var routeBuilder = new PipelineRouteBuilder<TCurrent, TKey, TNext>();
+        configureRoutes(routeBuilder);
+
+        if (routeBuilder.Routes.Count == 0 && routeBuilder.DefaultRoute is null)
+            throw new ArgumentException("At least one route or default route must be configured.", nameof(configureRoutes));
+
+        return new PipelineBuilder<TInput, TNext>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                var traceContext = PipelineTraceContext.Current;
+                if (traceContext is null)
+                    return await ExecuteRouteAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+                return await traceContext.TraceStepAsync(
+                    stepName ?? PipelineNodeKind.Route.ToString(),
+                    PipelineNodeKind.Route,
+                    typeof(TCurrent),
+                    typeof(TNext),
+                    () => ExecuteRouteAsync(currentValue, cancellationToken)).ConfigureAwait(false);
+            },
+            logger,
+            graph.AddStep(stepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Route));
+
+        async ValueTask<TNext> ExecuteRouteAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            var routeKey = routeSelector(currentValue);
+
+            if (routeBuilder.Routes.TryGetValue(routeKey, out var route))
+                return await route(currentValue, cancellationToken).ConfigureAwait(false);
+
+            if (routeBuilder.DefaultRoute is { } defaultRoute)
+                return await defaultRoute(currentValue, cancellationToken).ConfigureAwait(false);
+
+            throw new PipelineRouteNotFoundException(routeKey);
+        }
+    }
     /// <summary>
     /// Branches execution based on a predicate.
     /// </summary>
@@ -41,6 +117,21 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     public PipelineBuilder<TInput, TNext> Branch<TNext>(
         Func<TCurrent, bool> predicate,
         Func<TCurrent, TNext> whenTrue,
+        Func<TCurrent, TNext> whenFalse) =>
+        Branch(null, predicate, whenTrue, whenFalse);
+    /// <summary>
+    /// Branches execution based on a predicate.
+    /// </summary>
+    /// <typeparam name="TNext">The output type of both branches.</typeparam>
+    /// <param name="stepName">The branch display name used in pipeline descriptions.</param>
+    /// <param name="predicate">The branch condition.</param>
+    /// <param name="whenTrue">The branch executed when predicate is true.</param>
+    /// <param name="whenFalse">The branch executed when predicate is false.</param>
+    /// <returns>A new builder with the branch output type.</returns>
+    public PipelineBuilder<TInput, TNext> Branch<TNext>(
+        string? stepName,
+        Func<TCurrent, bool> predicate,
+        Func<TCurrent, TNext> whenTrue,
         Func<TCurrent, TNext> whenFalse)
     {
         ArgumentNullException.ThrowIfNull(predicate);
@@ -48,11 +139,11 @@ public sealed class PipelineBuilder<TInput, TCurrent>
         ArgumentNullException.ThrowIfNull(whenFalse);
 
         return BranchAsync(
+            stepName,
             predicate,
             (current, _) => ValueTask.FromResult(whenTrue(current)),
             (current, _) => ValueTask.FromResult(whenFalse(current)));
     }
-
     /// <summary>
     /// Branches execution based on a predicate.
     /// </summary>
@@ -62,6 +153,21 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="whenFalse">The branch executed when predicate is false.</param>
     /// <returns>A new builder with the branch output type.</returns>
     public PipelineBuilder<TInput, TNext> BranchAsync<TNext>(
+        Func<TCurrent, bool> predicate,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> whenTrue,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> whenFalse) =>
+        BranchAsync(null, predicate, whenTrue, whenFalse);
+    /// <summary>
+    /// Branches execution based on a predicate.
+    /// </summary>
+    /// <typeparam name="TNext">The output type of both branches.</typeparam>
+    /// <param name="stepName">The branch display name used in pipeline descriptions.</param>
+    /// <param name="predicate">The branch condition.</param>
+    /// <param name="whenTrue">The branch executed when predicate is true.</param>
+    /// <param name="whenFalse">The branch executed when predicate is false.</param>
+    /// <returns>A new builder with the branch output type.</returns>
+    public PipelineBuilder<TInput, TNext> BranchAsync<TNext>(
+        string? stepName,
         Func<TCurrent, bool> predicate,
         Func<TCurrent, CancellationToken, ValueTask<TNext>> whenTrue,
         Func<TCurrent, CancellationToken, ValueTask<TNext>> whenFalse)
@@ -78,7 +184,8 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                     ? await whenTrue(currentValue, cancellationToken).ConfigureAwait(false)
                     : await whenFalse(currentValue, cancellationToken).ConfigureAwait(false);
             },
-            logger);
+            logger,
+            graph.AddBranch(stepName, typeof(TCurrent), typeof(TNext)));
     }
 
     /// <summary>
@@ -90,11 +197,14 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     {
         var pipeline = new OperationPipeline<TInput, TCurrent>(logger)
             .AddOperation<TInput, TCurrent>(async (input, cancellationToken) =>
-                await chain(input, cancellationToken).ConfigureAwait(false));
+                await PipelineSagaContext.RunAsync(
+                    token => chain(input, token),
+                    cancellationToken).ConfigureAwait(false));
 
         if (!string.IsNullOrWhiteSpace(pipelineName))
             pipeline.Name = pipelineName;
 
+        pipeline.SetDefinition(graph.ToDefinition(pipeline.Id, pipeline.Name));
         return pipeline;
     }
 
@@ -105,6 +215,18 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="branches">The branch delegates to execute in parallel.</param>
     /// <returns>A new builder whose output is a fork execution result.</returns>
     public PipelineBuilder<TInput, ForkExecutionResult<TBranch>> Fork<TBranch>(
+        params Func<TCurrent, CancellationToken, ValueTask<TBranch>>?[] branches) =>
+        Fork(null, branches);
+
+    /// <summary>
+    /// Executes multiple branches in parallel for the current value.
+    /// </summary>
+    /// <typeparam name="TBranch">The branch output type.</typeparam>
+    /// <param name="stepName">The fork display name used in pipeline descriptions.</param>
+    /// <param name="branches">The branch delegates to execute in parallel.</param>
+    /// <returns>A new builder whose output is a fork execution result.</returns>
+    public PipelineBuilder<TInput, ForkExecutionResult<TBranch>> Fork<TBranch>(
+        string? stepName,
         params Func<TCurrent, CancellationToken, ValueTask<TBranch>>?[] branches)
     {
         ArgumentNullException.ThrowIfNull(branches);
@@ -130,7 +252,13 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                 var branchResults = await Task.WhenAll(branchTasks).ConfigureAwait(false);
                 return new ForkExecutionResult<TBranch>(branchResults);
             },
-            logger);
+            logger,
+            graph.AddFork(
+                stepName,
+                typeof(TCurrent),
+                typeof(TBranch),
+                typeof(ForkExecutionResult<TBranch>),
+                branches.Length));
 
         static async Task<ForkResult<TBranch>> ExecuteBranchAsync(
             Func<TCurrent, CancellationToken, ValueTask<TBranch>> branch,
@@ -159,6 +287,21 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="options">The merge options.</param>
     /// <returns>A new builder with the merge output type.</returns>
     public PipelineBuilder<TInput, TNext> Merge<TBranch, TNext>(
+        Func<IReadOnlyList<TBranch>, CancellationToken, ValueTask<TNext>> mergeStep,
+        MergeStepOptions? options = null) =>
+        Merge(null, mergeStep, options);
+
+    /// <summary>
+    /// Merges forked branch outputs into a single value.
+    /// </summary>
+    /// <typeparam name="TBranch">The branch output type.</typeparam>
+    /// <typeparam name="TNext">The merge output type.</typeparam>
+    /// <param name="stepName">The merge display name used in pipeline descriptions.</param>
+    /// <param name="mergeStep">The merge delegate.</param>
+    /// <param name="options">The merge options.</param>
+    /// <returns>A new builder with the merge output type.</returns>
+    public PipelineBuilder<TInput, TNext> Merge<TBranch, TNext>(
+        string? stepName,
         Func<IReadOnlyList<TBranch>, CancellationToken, ValueTask<TNext>> mergeStep,
         MergeStepOptions? options = null)
     {
@@ -215,7 +358,8 @@ public sealed class PipelineBuilder<TInput, TCurrent>
 
                 return await mergeStep(successfulResultsForMerge, cancellationToken).ConfigureAwait(false);
             },
-            logger);
+            logger,
+            graph.AddStep(stepName, typeof(ForkExecutionResult<TBranch>), typeof(TNext), PipelineNodeKind.Merge));
     }
 
     /// <summary>
@@ -224,17 +368,21 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <typeparam name="TNext">The next output type.</typeparam>
     /// <param name="step">The synchronous step delegate.</param>
     /// <returns>A new builder with updated output type.</returns>
-    public PipelineBuilder<TInput, TNext> Then<TNext>(Func<TCurrent, TNext> step)
+    public PipelineBuilder<TInput, TNext> Then<TNext>(Func<TCurrent, TNext> step) =>
+        Then(null, step);
+
+    /// <summary>
+    /// Appends a synchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The synchronous step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> Then<TNext>(string? stepName, Func<TCurrent, TNext> step)
     {
         ArgumentNullException.ThrowIfNull(step);
 
-        return new PipelineBuilder<TInput, TNext>(
-            async (input, cancellationToken) =>
-            {
-                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
-                return step(currentValue);
-            },
-            logger);
+        return ThenAsync(stepName, (current, _) => ValueTask.FromResult(step(current)));
     }
 
     /// <summary>
@@ -247,6 +395,18 @@ public sealed class PipelineBuilder<TInput, TCurrent>
         ThenAsync(step);
 
     /// <summary>
+    /// Appends an asynchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The asynchronous step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> Then<TNext>(
+        string? stepName,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
+        ThenAsync(stepName, step);
+
+    /// <summary>
     /// Appends a step produced by a factory.
     /// </summary>
     /// <typeparam name="TStep">The step type.</typeparam>
@@ -254,11 +414,23 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="stepFactory">Factory used to create the step instance.</param>
     /// <returns>A new builder with updated output type.</returns>
     public PipelineBuilder<TInput, TNext> Then<TStep, TNext>(Func<TStep> stepFactory)
+        where TStep : IPipelineStep<TCurrent, TNext> =>
+        Then<TStep, TNext>(typeof(TStep).Name, stepFactory);
+
+    /// <summary>
+    /// Appends a step produced by a factory.
+    /// </summary>
+    /// <typeparam name="TStep">The step type.</typeparam>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="stepFactory">Factory used to create the step instance.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> Then<TStep, TNext>(string stepName, Func<TStep> stepFactory)
         where TStep : IPipelineStep<TCurrent, TNext>
     {
         ArgumentNullException.ThrowIfNull(stepFactory);
 
-        return ThenAsync(async (value, cancellationToken) =>
+        return ThenAsync(stepName, async (value, cancellationToken) =>
         {
             var step = stepFactory();
             ArgumentNullException.ThrowIfNull(step);
@@ -267,13 +439,68 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     }
 
     /// <summary>
+    /// Appends a compensatable saga step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="execute">The step execution delegate.</param>
+    /// <param name="compensate">The compensation callback registered after successful execution.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenSaga<TNext>(
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> execute,
+        Func<TNext, CancellationToken, ValueTask> compensate,
+        StepExecutionOptions? options = null) =>
+        ThenSaga(null, execute, compensate, options);
+
+    /// <summary>
+    /// Appends a compensatable saga step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="execute">The step execution delegate.</param>
+    /// <param name="compensate">The compensation callback registered after successful execution.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenSaga<TNext>(
+        string? stepName,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> execute,
+        Func<TNext, CancellationToken, ValueTask> compensate,
+        StepExecutionOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(execute);
+        ArgumentNullException.ThrowIfNull(compensate);
+
+        return ThenAsyncCore(
+            stepName,
+            async (current, cancellationToken) =>
+            {
+                var result = await execute(current, cancellationToken).ConfigureAwait(false);
+                PipelineSagaContext.Current?.Register(token => compensate(result, token));
+                return result;
+            },
+            options,
+            PipelineNodeKind.Saga);
+    }
+    /// <summary>
     /// Appends an asynchronous step to the builder.
     /// </summary>
     /// <typeparam name="TNext">The next output type.</typeparam>
     /// <param name="step">The asynchronous step delegate.</param>
     /// <returns>A new builder with updated output type.</returns>
     public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
-        ThenAsync(step, StepExecutionOptions.None());
+        ThenAsyncCore(null, step, StepExecutionOptions.None());
+
+    /// <summary>
+    /// Appends an asynchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The asynchronous step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        string? stepName,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
+        ThenAsyncCore(stepName, step, StepExecutionOptions.None());
 
     /// <summary>
     /// Appends an asynchronous step to the builder.
@@ -284,25 +511,22 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <returns>A new builder with updated output type.</returns>
     public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
         Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
-        StepExecutionOptions? options)
-    {
-        ArgumentNullException.ThrowIfNull(step);
+        StepExecutionOptions? options) =>
+        ThenAsyncCore(null, step, options);
 
-        var effectiveOptions = options ?? StepExecutionOptions.None();
-
-        return new PipelineBuilder<TInput, TNext>(
-            async (input, cancellationToken) =>
-            {
-                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
-
-                if (effectiveOptions.Policy is { } policy)
-                    return await policy.ExecuteAsync(token => step(currentValue, token), cancellationToken)
-                        .ConfigureAwait(false);
-
-                return await step(currentValue, cancellationToken).ConfigureAwait(false);
-            },
-            logger);
-    }
+    /// <summary>
+    /// Appends an asynchronous step to the builder.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The asynchronous step delegate.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        string? stepName,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
+        StepExecutionOptions? options) =>
+        ThenAsyncCore(stepName, step, options);
 
     /// <summary>
     /// Appends a parallel projection step for sequence outputs.
@@ -313,6 +537,21 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="options">Parallel execution options.</param>
     /// <returns>A new builder whose output is the projected ordered results.</returns>
     public PipelineBuilder<TInput, IReadOnlyList<TNext>> ThenParallel<TItem, TNext>(
+        Func<TItem, CancellationToken, ValueTask<TNext>> step,
+        ParallelStepOptions? options = null) =>
+        ThenParallel(null, step, options);
+
+    /// <summary>
+    /// Appends a parallel projection step for sequence outputs.
+    /// </summary>
+    /// <typeparam name="TItem">The source sequence item type.</typeparam>
+    /// <typeparam name="TNext">The destination item type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The per-item asynchronous step.</param>
+    /// <param name="options">Parallel execution options.</param>
+    /// <returns>A new builder whose output is the projected ordered results.</returns>
+    public PipelineBuilder<TInput, IReadOnlyList<TNext>> ThenParallel<TItem, TNext>(
+        string? stepName,
         Func<TItem, CancellationToken, ValueTask<TNext>> step,
         ParallelStepOptions? options = null)
     {
@@ -350,9 +589,26 @@ public sealed class PipelineBuilder<TInput, TCurrent>
 
                 return results;
             },
-            logger);
+            logger,
+            graph.AddStep(stepName, typeof(TCurrent), typeof(IReadOnlyList<TNext>), PipelineNodeKind.Parallel));
     }
 
+    /// <summary>
+    /// Adds per-run state to the pipeline builder.
+    /// </summary>
+    /// <typeparam name="TState">The per-run state type.</typeparam>
+    /// <param name="stateFactory">Factory used to create state for each pipeline run.</param>
+    /// <returns>A stateful pipeline builder.</returns>
+    public StatefulPipelineBuilder<TInput, TCurrent, TState> WithState<TState>(Func<TState> stateFactory)
+    {
+        ArgumentNullException.ThrowIfNull(stateFactory);
+
+        return new StatefulPipelineBuilder<TInput, TCurrent, TState>(
+            async (input, _, cancellationToken) => await chain(input, cancellationToken).ConfigureAwait(false),
+            logger,
+            graph,
+            stateFactory);
+    }
     /// <summary>
     /// Adds an execution policy around the existing chain.
     /// </summary>
@@ -364,6 +620,80 @@ public sealed class PipelineBuilder<TInput, TCurrent>
 
         return new PipelineBuilder<TInput, TCurrent>(
             (input, cancellationToken) => policy.ExecuteAsync(token => chain(input, token), cancellationToken),
-            logger);
+            logger,
+            graph.AddStep(policy.GetType().Name, typeof(TCurrent), typeof(TCurrent), PipelineNodeKind.Policy));
+    }
+
+    private PipelineBuilder<TInput, TNext> ThenAsyncCore<TNext>(
+        string? stepName,
+        Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
+        StepExecutionOptions? options,
+        PipelineNodeKind nodeKind = PipelineNodeKind.Step)
+    {
+        ArgumentNullException.ThrowIfNull(step);
+
+        var effectiveOptions = options ?? StepExecutionOptions.None();
+        var effectiveStepName = stepName ?? effectiveOptions.Name;
+        var concurrencyGate = effectiveOptions.MaxConcurrency is { } maxConcurrency
+            ? new SemaphoreSlim(maxConcurrency, maxConcurrency)
+            : null;
+
+        return new PipelineBuilder<TInput, TNext>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                var traceContext = PipelineTraceContext.Current;
+                if (traceContext is null)
+                    return await ExecuteWithConcurrencyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+                return await traceContext.TraceStepAsync(
+                    effectiveStepName ?? nodeKind.ToString(),
+                    nodeKind,
+                    typeof(TCurrent),
+                    typeof(TNext),
+                    () => ExecuteWithConcurrencyAsync(currentValue, cancellationToken)).ConfigureAwait(false);
+            },
+            logger,
+            graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), nodeKind));
+
+        async ValueTask<TNext> ExecuteUserStepAsync(TCurrent currentValue, CancellationToken cancellationToken) =>
+            await step(currentValue, cancellationToken).ConfigureAwait(false);
+
+        async ValueTask<TNext> ExecuteWithPolicyAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            if (effectiveOptions.Policy is { } policy)
+                return await policy.ExecuteAsync(token => ExecuteUserStepAsync(currentValue, token), cancellationToken)
+                    .ConfigureAwait(false);
+
+            return await ExecuteUserStepAsync(currentValue, cancellationToken).ConfigureAwait(false);
+        }
+
+        async ValueTask<TNext> ExecuteWithRateLimitAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            if (effectiveOptions.RateLimiter is not { } rateLimiter)
+                return await ExecuteWithPolicyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+            using var lease = await rateLimiter.AcquireAsync(1, cancellationToken).ConfigureAwait(false);
+            if (!lease.IsAcquired)
+                throw new PipelineRateLimitRejectedException(effectiveStepName ?? "Unnamed step");
+
+            return await ExecuteWithPolicyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+        }
+
+        async ValueTask<TNext> ExecuteWithConcurrencyAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            if (concurrencyGate is null)
+                return await ExecuteWithRateLimitAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+            await concurrencyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await ExecuteWithRateLimitAsync(currentValue, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                concurrencyGate.Release();
+            }
+        }
     }
 }

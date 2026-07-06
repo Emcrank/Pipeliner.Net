@@ -16,31 +16,52 @@ namespace Pipeliner.Net;
 /// <typeparam name="TOutput">The stream output item type.</typeparam>
 public sealed class StreamPipeline<TInput, TOutput>
 {
-    private readonly Func<TInput, CancellationToken, ValueTask<TOutput>> chain;
+    private readonly Func<IAsyncEnumerable<TInput>, CancellationToken, IAsyncEnumerable<TOutput>> transform;
+    private PipelineDefinition? definition;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="StreamPipeline{TInput,TOutput}" /> class.
     /// </summary>
-    /// <param name="chain">The stream execution chain.</param>
+    /// <param name="transform">The stream execution transform.</param>
     /// <param name="logger">The optional logger used by stream execution.</param>
     /// <param name="backpressureOptions">The backpressure options.</param>
     internal StreamPipeline(
-        Func<TInput, CancellationToken, ValueTask<TOutput>> chain,
+        Func<IAsyncEnumerable<TInput>, CancellationToken, IAsyncEnumerable<TOutput>> transform,
         ILogger? logger,
         BackpressureOptions backpressureOptions)
     {
-        ArgumentNullException.ThrowIfNull(chain);
+        ArgumentNullException.ThrowIfNull(transform);
         ArgumentNullException.ThrowIfNull(backpressureOptions);
 
-        this.chain = chain;
+        this.transform = transform;
         Logger = logger;
         BackpressureOptions = backpressureOptions;
     }
 
     /// <summary>
+    /// Gets or sets the unique stream pipeline identifier.
+    /// </summary>
+    public string Id { get; internal set; } = Guid.NewGuid().ToString("D");
+
+    /// <summary>
     /// Gets or sets the friendly stream pipeline name.
     /// </summary>
     public string Name { get; internal set; } = "Unnamed_Stream_Pipeline";
+
+    /// <summary>
+    /// Gets a structural description of this stream pipeline.
+    /// </summary>
+    /// <returns>The pipeline definition graph.</returns>
+    public PipelineDefinition Describe() => definition ??= PipelineGraph
+        .Create(typeof(TInput))
+        .AddStep("Result", typeof(TInput), typeof(TOutput), PipelineNodeKind.Step)
+        .ToDefinition(Id, Name);
+
+    /// <summary>
+    /// Validates the stream pipeline definition without executing pipeline steps.
+    /// </summary>
+    /// <returns>A dry-run validation report.</returns>
+    public PipelineDryRunReport DryRun() => PipelineDryRunReport.Validate(Describe());
 
     /// <summary>
     /// Gets the configured backpressure options.
@@ -77,10 +98,11 @@ public sealed class StreamPipeline<TInput, TOutput>
 
         try
         {
-            await foreach (var item in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            var transformedItems = transform(channel.Reader.ReadAllAsync(cancellationToken), cancellationToken);
+            await foreach (var item in transformedItems.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                yield return await chain(item, cancellationToken).ConfigureAwait(false);
+                yield return item;
             }
 
             await AwaitProducerCompletionAsync(producerTask, cancellationToken, suppressCancellationException: false).ConfigureAwait(false);
@@ -90,6 +112,12 @@ public sealed class StreamPipeline<TInput, TOutput>
             channel.Writer.TryComplete();
             await AwaitProducerCompletionAsync(producerTask, cancellationToken, suppressCancellationException: true).ConfigureAwait(false);
         }
+    }
+
+    internal void SetDefinition(PipelineDefinition pipelineDefinition)
+    {
+        ArgumentNullException.ThrowIfNull(pipelineDefinition);
+        definition = pipelineDefinition;
     }
 
     private static async Task AwaitProducerCompletionAsync(

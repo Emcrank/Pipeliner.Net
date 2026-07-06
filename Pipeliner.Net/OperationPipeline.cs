@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -19,6 +19,7 @@ public sealed class OperationPipeline<TParam, TResult>
     private readonly List<IUntypedOperation> operations = [];
     private readonly AsyncLocal<RunContext?> currentRunContext = new();
     private Func<TResult?>? configuredResultFactory;
+    private PipelineDefinition? definition;
 
     /// <summary>
     /// Initializes a new instance of <see cref="OperationPipeline{TParam,TResult}" />
@@ -38,6 +39,21 @@ public sealed class OperationPipeline<TParam, TResult>
     /// Gets or sets the friendly pipeline name.
     /// </summary>
     public string Name { get; internal set; } = "Unnamed_Pipeline";
+
+    /// <summary>
+    /// Gets a structural description of this pipeline.
+    /// </summary>
+    /// <returns>The pipeline definition graph.</returns>
+    public PipelineDefinition Describe() => definition ??= PipelineGraph
+        .Create(typeof(TParam))
+        .AddStep("Result", typeof(TParam), typeof(TResult), PipelineNodeKind.Step)
+        .ToDefinition(Id, Name);
+
+    /// <summary>
+    /// Validates the pipeline definition without executing pipeline steps.
+    /// </summary>
+    /// <returns>A dry-run validation report.</returns>
+    public PipelineDryRunReport DryRun() => PipelineDryRunReport.Validate(Describe());
 
     /// <summary>
     /// Gets the logger used by this pipeline.
@@ -153,6 +169,24 @@ public sealed class OperationPipeline<TParam, TResult>
         }
     }
 
+    /// <summary>
+    /// Executes the pipeline synchronously and captures step trace metadata.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <returns>The pipeline result with trace metadata.</returns>
+    public PipelineRunResult<TResult?> RunWithTrace(TParam parameter) =>
+        PipelineTraceContext.Run(() => Run(parameter));
+
+    /// <summary>
+    /// Executes the pipeline asynchronously and captures step trace metadata.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The pipeline result with trace metadata.</returns>
+    public Task<PipelineRunResult<TResult?>> RunWithTraceAsync(
+        TParam parameter,
+        CancellationToken cancellationToken = default) =>
+        PipelineTraceContext.RunAsync(() => RunAsync(parameter, cancellationToken));
     /// <summary>
     /// Executes the configured pipeline for each input item from an asynchronous source.
     /// </summary>
@@ -328,6 +362,12 @@ public sealed class OperationPipeline<TParam, TResult>
     /// <param name="now">The start timestamp.</param>
     private void LogPipelineStart(DateTimeOffset now) =>
         Logger?.LogInformation("Pipeline [{PipelineId}](`{PipelineName}`) starting at {Now}...", Id, Name, now);
+
+    internal void SetDefinition(PipelineDefinition pipelineDefinition)
+    {
+        ArgumentNullException.ThrowIfNull(pipelineDefinition);
+        definition = pipelineDefinition;
+    }
 
     private void Reset() => configuredResultFactory = null;
 
