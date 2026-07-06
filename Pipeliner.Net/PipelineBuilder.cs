@@ -38,6 +38,75 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     }
 
     /// <summary>
+    /// Routes execution to a keyed route handler based on runtime data.
+    /// </summary>
+    /// <typeparam name="TKey">The route key type.</typeparam>
+    /// <typeparam name="TNext">The route output type.</typeparam>
+    /// <param name="routeSelector">The route key selector.</param>
+    /// <param name="configureRoutes">The route configuration callback.</param>
+    /// <returns>A new builder with the route output type.</returns>
+    public PipelineBuilder<TInput, TNext> RouteBy<TKey, TNext>(
+        Func<TCurrent, TKey> routeSelector,
+        Action<PipelineRouteBuilder<TCurrent, TKey, TNext>> configureRoutes)
+        where TKey : notnull =>
+        RouteBy(null, routeSelector, configureRoutes);
+
+    /// <summary>
+    /// Routes execution to a keyed route handler based on runtime data.
+    /// </summary>
+    /// <typeparam name="TKey">The route key type.</typeparam>
+    /// <typeparam name="TNext">The route output type.</typeparam>
+    /// <param name="stepName">The route display name used in pipeline descriptions.</param>
+    /// <param name="routeSelector">The route key selector.</param>
+    /// <param name="configureRoutes">The route configuration callback.</param>
+    /// <returns>A new builder with the route output type.</returns>
+    public PipelineBuilder<TInput, TNext> RouteBy<TKey, TNext>(
+        string? stepName,
+        Func<TCurrent, TKey> routeSelector,
+        Action<PipelineRouteBuilder<TCurrent, TKey, TNext>> configureRoutes)
+        where TKey : notnull
+    {
+        ArgumentNullException.ThrowIfNull(routeSelector);
+        ArgumentNullException.ThrowIfNull(configureRoutes);
+
+        var routeBuilder = new PipelineRouteBuilder<TCurrent, TKey, TNext>();
+        configureRoutes(routeBuilder);
+
+        if (routeBuilder.Routes.Count == 0 && routeBuilder.DefaultRoute is null)
+            throw new ArgumentException("At least one route or default route must be configured.", nameof(configureRoutes));
+
+        return new PipelineBuilder<TInput, TNext>(
+            async (input, cancellationToken) =>
+            {
+                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
+                var traceContext = PipelineTraceContext.Current;
+                if (traceContext is null)
+                    return await ExecuteRouteAsync(currentValue, cancellationToken).ConfigureAwait(false);
+
+                return await traceContext.TraceStepAsync(
+                    stepName ?? PipelineNodeKind.Route.ToString(),
+                    PipelineNodeKind.Route,
+                    typeof(TCurrent),
+                    typeof(TNext),
+                    () => ExecuteRouteAsync(currentValue, cancellationToken)).ConfigureAwait(false);
+            },
+            logger,
+            graph.AddStep(stepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Route));
+
+        async ValueTask<TNext> ExecuteRouteAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        {
+            var routeKey = routeSelector(currentValue);
+
+            if (routeBuilder.Routes.TryGetValue(routeKey, out var route))
+                return await route(currentValue, cancellationToken).ConfigureAwait(false);
+
+            if (routeBuilder.DefaultRoute is { } defaultRoute)
+                return await defaultRoute(currentValue, cancellationToken).ConfigureAwait(false);
+
+            throw new PipelineRouteNotFoundException(routeKey);
+        }
+    }
+    /// <summary>
     /// Branches execution based on a predicate.
     /// </summary>
     /// <typeparam name="TNext">The output type of both branches.</typeparam>
@@ -50,7 +119,6 @@ public sealed class PipelineBuilder<TInput, TCurrent>
         Func<TCurrent, TNext> whenTrue,
         Func<TCurrent, TNext> whenFalse) =>
         Branch(null, predicate, whenTrue, whenFalse);
-
     /// <summary>
     /// Branches execution based on a predicate.
     /// </summary>
@@ -76,7 +144,6 @@ public sealed class PipelineBuilder<TInput, TCurrent>
             (current, _) => ValueTask.FromResult(whenTrue(current)),
             (current, _) => ValueTask.FromResult(whenFalse(current)));
     }
-
     /// <summary>
     /// Branches execution based on a predicate.
     /// </summary>
@@ -90,7 +157,6 @@ public sealed class PipelineBuilder<TInput, TCurrent>
         Func<TCurrent, CancellationToken, ValueTask<TNext>> whenTrue,
         Func<TCurrent, CancellationToken, ValueTask<TNext>> whenFalse) =>
         BranchAsync(null, predicate, whenTrue, whenFalse);
-
     /// <summary>
     /// Branches execution based on a predicate.
     /// </summary>

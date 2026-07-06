@@ -21,6 +21,11 @@ public enum PipelineNodeKind
     Branch,
 
     /// <summary>
+    /// A keyed dynamic routing decision.
+    /// </summary>
+    Route,
+
+    /// <summary>
     /// One of the possible branch paths.
     /// </summary>
     BranchPath,

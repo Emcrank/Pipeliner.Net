@@ -201,7 +201,23 @@ var pipeline = Pipeline
     .Build();
 ```
 
-### 8) Branch and branch async
+### 8) Dynamic routing
+
+```csharp
+var pipeline = Pipeline
+    .For<Payment>()
+    .RouteBy<PaymentMethod, PaymentResult>(
+        "Payment method route",
+        payment => payment.Method,
+        routes => routes
+            .When(PaymentMethod.Card, ChargeCard)
+            .WhenAsync(PaymentMethod.BankTransfer, StartBankTransferAsync)
+            .Default(payment => PaymentResult.Rejected(payment.Id)))
+    .Build();
+```
+
+If no route matches and no default route is configured, `PipelineRouteNotFoundException` is thrown.
+### 9) Branch and branch async
 
 ```csharp
 var pipeline = Pipeline
@@ -220,7 +236,7 @@ var label = await pipeline.RunAsync(150);
 // large:150
 ```
 
-### 9) Fork + merge (custom reducer)
+### 10) Fork + merge (custom reducer)
 
 ```csharp
 var pipeline = Pipeline
@@ -237,7 +253,7 @@ Console.WriteLine(finalPrice);
 // 371.6
 ```
 
-### 10) Built-in merge strategy: throw on any failure
+### 11) Built-in merge strategy: throw on any failure
 
 ```csharp
 var pipeline = Pipeline
@@ -254,7 +270,7 @@ var pipeline = Pipeline
 await Assert.ThrowsAsync<AggregateException>(() => pipeline.RunAsync(10));
 ```
 
-### 11) Built-in merge strategy: ignore failures
+### 12) Built-in merge strategy: ignore failures
 
 ```csharp
 var pipeline = Pipeline
@@ -272,7 +288,7 @@ var results = await pipeline.RunAsync(10);
 // [11, 13]
 ```
 
-### 12) Built-in merge strategy: take first
+### 13) Built-in merge strategy: take first
 
 ```csharp
 var pipeline = Pipeline
@@ -289,7 +305,7 @@ var first = await pipeline.RunAsync(10);
 // 11
 ```
 
-### 13) Parallel projection
+### 14) Parallel projection
 
 ```csharp
 var pipeline = Pipeline
