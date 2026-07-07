@@ -38,5 +38,10 @@ internal sealed class ExecutablePipelineStep<TInput, TOutput> : IExecutablePipel
         object? input,
         PipelineExecutionContext context,
         CancellationToken cancellationToken) =>
-        await execute((TInput)input!, context, cancellationToken).ConfigureAwait(false);
+        await context.ExecuteStepAsync(
+            Id,
+            Name,
+            Kind,
+            async (stepContext, token) => await execute((TInput)input!, stepContext, token).ConfigureAwait(false),
+            cancellationToken).ConfigureAwait(false);
 }

@@ -18,6 +18,7 @@ public sealed record PipelineCheckpoint
     /// <param name="payloadType">The assembly-qualified checkpoint payload type.</param>
     /// <param name="payloadJson">The serialized checkpoint payload.</param>
     /// <param name="createdAt">The checkpoint creation timestamp.</param>
+    /// <param name="pipelineVersion">The pipeline version that produced the checkpoint.</param>
     public PipelineCheckpoint(
         string runId,
         string pipelineId,
@@ -26,7 +27,8 @@ public sealed record PipelineCheckpoint
         string nodeId,
         string payloadType,
         string payloadJson,
-        DateTimeOffset createdAt)
+        DateTimeOffset createdAt,
+        string? pipelineVersion = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(runId);
         ArgumentException.ThrowIfNullOrWhiteSpace(pipelineId);
@@ -39,6 +41,7 @@ public sealed record PipelineCheckpoint
         RunId = runId;
         PipelineId = pipelineId;
         PipelineName = pipelineName;
+        PipelineVersion = string.IsNullOrWhiteSpace(pipelineVersion) ? "1.0.0" : pipelineVersion;
         CheckpointName = checkpointName;
         NodeId = nodeId;
         PayloadType = payloadType;
@@ -60,6 +63,11 @@ public sealed record PipelineCheckpoint
     /// Gets the pipeline display name.
     /// </summary>
     public string PipelineName { get; }
+
+    /// <summary>
+    /// Gets the pipeline version that produced the checkpoint.
+    /// </summary>
+    public string PipelineVersion { get; }
 
     /// <summary>
     /// Gets the checkpoint display name.

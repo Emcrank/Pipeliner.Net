@@ -41,13 +41,18 @@ public sealed class OperationPipeline<TParam, TResult>
     public string Name { get; internal set; } = "Unnamed_Pipeline";
 
     /// <summary>
+    /// Gets or sets the pipeline definition version.
+    /// </summary>
+    public string Version { get; internal set; } = "1.0.0";
+
+    /// <summary>
     /// Gets a structural description of this pipeline.
     /// </summary>
     /// <returns>The pipeline definition graph.</returns>
     public PipelineDefinition Describe() => definition ??= PipelineGraph
         .Create(typeof(TParam))
         .AddStep("Result", typeof(TParam), typeof(TResult), PipelineNodeKind.Step)
-        .ToDefinition(Id, Name);
+        .ToDefinition(Id, Name, Version);
 
     /// <summary>
     /// Validates the pipeline definition without executing pipeline steps.
@@ -169,6 +174,59 @@ public sealed class OperationPipeline<TParam, TResult>
         }
     }
 
+    /// <summary>
+    /// Executes the pipeline synchronously and returns a non-throwing run outcome for controlled halts and failures.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <returns>The pipeline run outcome.</returns>
+    public PipelineRunOutcome<TResult?> RunWithStatus(TParam parameter)
+    {
+        try
+        {
+            return PipelineRunOutcome<TResult?>.Completed(Run(parameter));
+        }
+        catch (PipelineHaltedException exception)
+        {
+            return PipelineRunOutcome<TResult?>.Halted(CreateHalt(exception));
+        }
+        catch (OperationCanceledException exception)
+        {
+            return PipelineRunOutcome<TResult?>.Cancelled(exception);
+        }
+        catch (Exception exception)
+        {
+            return PipelineRunOutcome<TResult?>.Failed(exception);
+        }
+    }
+
+    /// <summary>
+    /// Executes the pipeline asynchronously and returns a non-throwing run outcome for controlled halts and failures.
+    /// </summary>
+    /// <param name="parameter">The pipeline input parameter.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The pipeline run outcome.</returns>
+    public async Task<PipelineRunOutcome<TResult?>> RunWithStatusAsync(
+        TParam parameter,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await RunAsync(parameter, cancellationToken).ConfigureAwait(false);
+            return PipelineRunOutcome<TResult?>.Completed(result);
+        }
+        catch (PipelineHaltedException exception)
+        {
+            return PipelineRunOutcome<TResult?>.Halted(CreateHalt(exception));
+        }
+        catch (OperationCanceledException exception)
+        {
+            return PipelineRunOutcome<TResult?>.Cancelled(exception);
+        }
+        catch (Exception exception)
+        {
+            return PipelineRunOutcome<TResult?>.Failed(exception);
+        }
+    }
     /// <summary>
     /// Executes the pipeline synchronously and captures step trace metadata.
     /// </summary>
@@ -369,6 +427,14 @@ public sealed class OperationPipeline<TParam, TResult>
         definition = pipelineDefinition;
     }
 
+    private PipelineHalt CreateHalt(PipelineHaltedException exception) =>
+        new(
+            exception.RunId,
+            Id,
+            Name,
+            Version,
+            exception.HaltName,
+            exception.NodeId);
     private void Reset() => configuredResultFactory = null;
 
     private TResult? RunInternal(RunContext runContext, CancellationToken cancellationToken = default)

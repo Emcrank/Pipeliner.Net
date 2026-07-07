@@ -116,8 +116,8 @@ internal sealed class PipelineGraph
         return new PipelineGraph(nodes, edges, node.Id, NextNodeIndex + 1);
     }
 
-    public PipelineDefinition ToDefinition(string pipelineId, string pipelineName) =>
-        new(pipelineId, pipelineName, Nodes, Edges);
+    public PipelineDefinition ToDefinition(string pipelineId, string pipelineName, string? pipelineVersion = null) =>
+        new(pipelineId, pipelineName, Nodes, Edges, pipelineVersion);
 
     private static PipelineNode CreateNode(
         string name,

@@ -19,6 +19,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     private readonly PipelineExecutablePlan<TInput, TCurrent> plan;
     private readonly PipelineGraph graph;
     private readonly ILogger? logger;
+    private readonly IReadOnlyList<IPipelineObserver> observers;
 
     /// <summary>
     /// Initializes a new instance of <see cref="PipelineBuilder{TInput,TCurrent}" />.
@@ -28,12 +29,14 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="graph">The pipeline definition graph.</param>
     /// <param name="plan">The optional executable pipeline plan.</param>
     /// <param name="checkpointOptions">The optional checkpoint persistence options.</param>
+    /// <param name="observers">The optional pipeline observers.</param>
     internal PipelineBuilder(
         Func<TInput, CancellationToken, ValueTask<TCurrent>> chain,
         ILogger? logger,
         PipelineGraph graph,
         PipelineExecutablePlan<TInput, TCurrent>? plan = null,
-        PipelineCheckpointOptions? checkpointOptions = null)
+        PipelineCheckpointOptions? checkpointOptions = null,
+        IReadOnlyList<IPipelineObserver>? observers = null)
     {
         ArgumentNullException.ThrowIfNull(chain);
         ArgumentNullException.ThrowIfNull(graph);
@@ -49,6 +52,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                 graph.TerminalNode.Kind,
                 async (input, _, cancellationToken) => await chain(input, cancellationToken).ConfigureAwait(false));
         this.checkpointOptions = checkpointOptions;
+        this.observers = observers ?? [];
     }
 
     /// <summary>
@@ -107,7 +111,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
             logger,
             graph.AddStep(stepName, typeof(TCurrent), typeof(TNext), PipelineNodeKind.Route),
             null,
-            checkpointOptions);
+            checkpointOptions, observers);
 
         async ValueTask<TNext> ExecuteRouteAsync(TCurrent currentValue, CancellationToken cancellationToken)
         {
@@ -205,20 +209,24 @@ public sealed class PipelineBuilder<TInput, TCurrent>
             logger,
             graph.AddBranch(stepName, typeof(TCurrent), typeof(TNext)),
             null,
-            checkpointOptions);
+            checkpointOptions, observers);
     }
 
     /// <summary>
     /// Builds an <see cref="OperationPipeline{TParam, TResult}" /> from the current chain.
     /// </summary>
     /// <param name="pipelineName">Optional pipeline name.</param>
+    /// <param name="pipelineVersion">Optional pipeline definition version.</param>
     /// <returns>The built operation pipeline.</returns>
-    public OperationPipeline<TInput, TCurrent> Build(string? pipelineName = null)
+    public OperationPipeline<TInput, TCurrent> Build(string? pipelineName = null, string? pipelineVersion = null)
     {
         var pipeline = new OperationPipeline<TInput, TCurrent>(logger);
 
         if (!string.IsNullOrWhiteSpace(pipelineName))
             pipeline.Name = pipelineName;
+
+        var effectivePipelineVersion = string.IsNullOrWhiteSpace(pipelineVersion) ? "1.0.0" : pipelineVersion;
+        pipeline.Version = effectivePipelineVersion;
 
         pipeline.AddOperation<TInput, TCurrent>(async (input, cancellationToken) =>
         {
@@ -226,20 +234,51 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                 Guid.NewGuid().ToString("D"),
                 pipeline.Id,
                 pipeline.Name,
-                checkpointOptions);
+                effectivePipelineVersion,
+                checkpointOptions,
+                observers);
 
-            return await PipelineExecutionContext.RunAsync(
-                executionContext,
-                token => PipelineSagaContext.RunAsync(
-                    sagaToken => plan.ExecuteAsync(input, executionContext, sagaToken),
-                    token),
-                cancellationToken).ConfigureAwait(false);
+            var startedAt = DateTimeOffset.UtcNow;
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            await executionContext.NotifyRunStartedAsync(startedAt, cancellationToken).ConfigureAwait(false);
+
+            try
+            {
+                var result = await PipelineExecutionContext.RunAsync(
+                    executionContext,
+                    token => PipelineSagaContext.RunAsync(
+                        sagaToken => plan.ExecuteAsync(input, executionContext, sagaToken),
+                        token),
+                    cancellationToken).ConfigureAwait(false);
+
+                await executionContext.NotifyRunCompletedAsync(
+                    startedAt,
+                    DateTimeOffset.UtcNow,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(started),
+                    cancellationToken).ConfigureAwait(false);
+
+                return result;
+            }
+            catch (PipelineHaltedException exception)
+            {
+                await executionContext.NotifyRunHaltedAsync(exception, cancellationToken).ConfigureAwait(false);
+                throw;
+            }
+            catch (Exception exception)
+            {
+                await executionContext.NotifyRunFailedAsync(
+                    startedAt,
+                    DateTimeOffset.UtcNow,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(started),
+                    exception,
+                    cancellationToken).ConfigureAwait(false);
+                throw;
+            }
         });
 
-        pipeline.SetDefinition(graph.ToDefinition(pipeline.Id, pipeline.Name));
+        pipeline.SetDefinition(graph.ToDefinition(pipeline.Id, pipeline.Name, effectivePipelineVersion));
         return pipeline;
     }
-
     /// <summary>
     /// Executes multiple branches in parallel for the current value.
     /// </summary>
@@ -292,7 +331,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
                 typeof(ForkExecutionResult<TBranch>),
                 branches.Length),
             null,
-            checkpointOptions);
+            checkpointOptions, observers);
 
         static async Task<ForkResult<TBranch>> ExecuteBranchAsync(
             Func<TCurrent, CancellationToken, ValueTask<TBranch>> branch,
@@ -395,7 +434,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
             logger,
             graph.AddStep(stepName, typeof(ForkExecutionResult<TBranch>), typeof(TNext), PipelineNodeKind.Merge),
             null,
-            checkpointOptions);
+            checkpointOptions, observers);
     }
 
     /// <summary>
@@ -508,7 +547,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
 
         return ThenAsyncCore(
             stepName,
-            async (current, cancellationToken) =>
+            async (current, _, cancellationToken) =>
             {
                 var result = await execute(current, cancellationToken).ConfigureAwait(false);
                 PipelineSagaContext.Current?.Register(token => compensate(result, token));
@@ -525,7 +564,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     /// <param name="step">The asynchronous step delegate.</param>
     /// <returns>A new builder with updated output type.</returns>
     public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
-        ThenAsyncCore(null, step, StepExecutionOptions.None());
+        ThenAsyncCore(null, (current, _, cancellationToken) => step(current, cancellationToken), StepExecutionOptions.None());
 
     /// <summary>
     /// Appends an asynchronous step to the builder.
@@ -537,7 +576,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
         string? stepName,
         Func<TCurrent, CancellationToken, ValueTask<TNext>> step) =>
-        ThenAsyncCore(stepName, step, StepExecutionOptions.None());
+        ThenAsyncCore(stepName, (current, _, cancellationToken) => step(current, cancellationToken), StepExecutionOptions.None());
 
     /// <summary>
     /// Appends an asynchronous step to the builder.
@@ -549,7 +588,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
         Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
         StepExecutionOptions? options) =>
-        ThenAsyncCore(null, step, options);
+        ThenAsyncCore(null, (current, _, cancellationToken) => step(current, cancellationToken), options);
 
     /// <summary>
     /// Appends an asynchronous step to the builder.
@@ -563,7 +602,86 @@ public sealed class PipelineBuilder<TInput, TCurrent>
         string? stepName,
         Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
         StepExecutionOptions? options) =>
+        ThenAsyncCore(stepName, (current, _, cancellationToken) => step(current, cancellationToken), options);
+
+    /// <summary>
+    /// Appends an asynchronous step that can inspect the active execution context.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="step">The asynchronous context-aware step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        Func<TCurrent, PipelineExecutionContext, CancellationToken, ValueTask<TNext>> step) =>
+        ThenAsyncCore(null, step, StepExecutionOptions.None());
+
+    /// <summary>
+    /// Appends an asynchronous step that can inspect the active execution context.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The asynchronous context-aware step delegate.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        string? stepName,
+        Func<TCurrent, PipelineExecutionContext, CancellationToken, ValueTask<TNext>> step) =>
+        ThenAsyncCore(stepName, step, StepExecutionOptions.None());
+
+    /// <summary>
+    /// Appends an asynchronous step that can inspect the active execution context.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="step">The asynchronous context-aware step delegate.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        Func<TCurrent, PipelineExecutionContext, CancellationToken, ValueTask<TNext>> step,
+        StepExecutionOptions? options) =>
+        ThenAsyncCore(null, step, options);
+
+    /// <summary>
+    /// Appends an asynchronous step that can inspect the active execution context.
+    /// </summary>
+    /// <typeparam name="TNext">The next output type.</typeparam>
+    /// <param name="stepName">The step display name used in pipeline descriptions.</param>
+    /// <param name="step">The asynchronous context-aware step delegate.</param>
+    /// <param name="options">The step execution options.</param>
+    /// <returns>A new builder with updated output type.</returns>
+    public PipelineBuilder<TInput, TNext> ThenAsync<TNext>(
+        string? stepName,
+        Func<TCurrent, PipelineExecutionContext, CancellationToken, ValueTask<TNext>> step,
+        StepExecutionOptions? options) =>
         ThenAsyncCore(stepName, step, options);
+
+    /// <summary>
+    /// Halts the pipeline when the predicate returns true.
+    /// </summary>
+    /// <param name="predicate">The halt condition.</param>
+    /// <returns>A new builder with a halt gate.</returns>
+    public PipelineBuilder<TInput, TCurrent> HaltWhen(Func<TCurrent, bool> predicate) =>
+        HaltWhen(null, predicate);
+
+    /// <summary>
+    /// Halts the pipeline when the predicate returns true.
+    /// </summary>
+    /// <param name="haltName">The halt display name used in pipeline descriptions and halt events.</param>
+    /// <param name="predicate">The halt condition.</param>
+    /// <returns>A new builder with a halt gate.</returns>
+    public PipelineBuilder<TInput, TCurrent> HaltWhen(string? haltName, Func<TCurrent, bool> predicate)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+
+        return ThenAsyncCore(
+            haltName,
+            (current, context, _) =>
+            {
+                if (predicate(current))
+                    throw new PipelineHaltedException(context.RunId, context.StepName ?? "Halt", context.StepId ?? "halt");
+
+                return ValueTask.FromResult(current);
+            },
+            StepExecutionOptions.None(),
+            PipelineNodeKind.Halt);
+    }
 
     /// <summary>
     /// Appends a parallel projection step for sequence outputs.
@@ -596,10 +714,10 @@ public sealed class PipelineBuilder<TInput, TCurrent>
 
         var effectiveOptions = options ?? ParallelStepOptions.Default();
 
-        return new PipelineBuilder<TInput, IReadOnlyList<TNext>>(
-            async (input, cancellationToken) =>
+        return ThenAsyncCore<IReadOnlyList<TNext>>(
+            stepName,
+            async (currentValue, _, cancellationToken) =>
             {
-                var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
                 if (currentValue is not IEnumerable<TItem> sourceItems)
                     throw new InvalidOperationException(
                         $"{nameof(ThenParallel)} requires the current value to implement {nameof(IEnumerable<>)}.");
@@ -626,10 +744,26 @@ public sealed class PipelineBuilder<TInput, TCurrent>
 
                 return results;
             },
+            StepExecutionOptions.None(),
+            PipelineNodeKind.Parallel);
+    }
+
+    /// <summary>
+    /// Adds an observer for run, step, halt, and checkpoint events.
+    /// </summary>
+    /// <param name="observer">The observer to add.</param>
+    /// <returns>A new builder with the observer configured.</returns>
+    public PipelineBuilder<TInput, TCurrent> WithObserver(IPipelineObserver observer)
+    {
+        ArgumentNullException.ThrowIfNull(observer);
+
+        return new PipelineBuilder<TInput, TCurrent>(
+            chain,
             logger,
-            graph.AddStep(stepName, typeof(TCurrent), typeof(IReadOnlyList<TNext>), PipelineNodeKind.Parallel),
-            null,
-            checkpointOptions);
+            graph,
+            plan,
+            checkpointOptions,
+            observers.Concat([observer]).ToArray());
     }
 
     /// <summary>
@@ -641,7 +775,7 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        return new PipelineBuilder<TInput, TCurrent>(chain, logger, graph, plan, options);
+        return new PipelineBuilder<TInput, TCurrent>(chain, logger, graph, plan, options, observers);
     }
 
     /// <summary>
@@ -671,33 +805,32 @@ public sealed class PipelineBuilder<TInput, TCurrent>
         var nextGraph = graph.AddStep(checkpointName, typeof(TCurrent), typeof(TCurrent), PipelineNodeKind.Checkpoint);
         var checkpointNode = nextGraph.TerminalNode;
 
-        var nextPlan = plan.Then(
-            checkpointNode.Id,
-            checkpointNode.Name,
-            checkpointNode.Kind,
-            async (current, context, cancellationToken) =>
-            {
-                await context.SaveCheckpointAsync(checkpointName, checkpointNode.Id, current, cancellationToken)
-                    .ConfigureAwait(false);
-                return current;
-            });
+        async ValueTask<TCurrent> SaveAsync(
+            TCurrent current,
+            PipelineExecutionContext context,
+            CancellationToken cancellationToken)
+        {
+            await context.SaveCheckpointAsync(checkpointName, checkpointNode.Id, current, cancellationToken)
+                .ConfigureAwait(false);
+            return current;
+        }
+
+        var nextPlan = plan.Then(checkpointNode.Id, checkpointNode.Name, checkpointNode.Kind, SaveAsync);
 
         return new PipelineBuilder<TInput, TCurrent>(
             async (input, cancellationToken) =>
             {
                 var current = await chain(input, cancellationToken).ConfigureAwait(false);
                 if (PipelineExecutionContext.Current is { } context)
-                {
-                    await context.SaveCheckpointAsync(checkpointName, checkpointNode.Id, current, cancellationToken)
-                        .ConfigureAwait(false);
-                }
+                    return await SaveAsync(current, context, cancellationToken).ConfigureAwait(false);
 
                 return current;
             },
             logger,
             nextGraph,
             nextPlan,
-            checkpointOptions);
+            checkpointOptions,
+            observers);
     }
 
     /// <summary>
@@ -715,7 +848,8 @@ public sealed class PipelineBuilder<TInput, TCurrent>
             logger,
             graph,
             stateFactory,
-            checkpointOptions);
+            checkpointOptions,
+            observers);
     }
 
     /// <summary>
@@ -727,17 +861,29 @@ public sealed class PipelineBuilder<TInput, TCurrent>
     {
         ArgumentNullException.ThrowIfNull(policy);
 
+        var nextGraph = graph.AddStep(policy.GetType().Name, typeof(TCurrent), typeof(TCurrent), PipelineNodeKind.Policy);
+        var policyNode = nextGraph.TerminalNode;
+        var nextPlan = PipelineExecutablePlan<TInput, TInput>
+            .Create()
+            .Then(
+                policyNode.Id,
+                policyNode.Name,
+                policyNode.Kind,
+                (input, context, cancellationToken) =>
+                    policy.ExecuteAsync(token => plan.ExecuteAsync(input, context, token), cancellationToken));
+
         return new PipelineBuilder<TInput, TCurrent>(
             (input, cancellationToken) => policy.ExecuteAsync(token => chain(input, token), cancellationToken),
             logger,
-            graph.AddStep(policy.GetType().Name, typeof(TCurrent), typeof(TCurrent), PipelineNodeKind.Policy),
-            null,
-            checkpointOptions);
+            nextGraph,
+            nextPlan,
+            checkpointOptions,
+            observers);
     }
 
     private PipelineBuilder<TInput, TNext> ThenAsyncCore<TNext>(
         string? stepName,
-        Func<TCurrent, CancellationToken, ValueTask<TNext>> step,
+        Func<TCurrent, PipelineExecutionContext, CancellationToken, ValueTask<TNext>> step,
         StepExecutionOptions? options,
         PipelineNodeKind nodeKind = PipelineNodeKind.Step)
     {
@@ -745,63 +891,99 @@ public sealed class PipelineBuilder<TInput, TCurrent>
 
         var effectiveOptions = options ?? StepExecutionOptions.None();
         var effectiveStepName = stepName ?? effectiveOptions.Name;
+        var nextGraph = graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), nodeKind);
+        var stepNode = nextGraph.TerminalNode;
         var concurrencyGate = effectiveOptions.MaxConcurrency is { } maxConcurrency
             ? new SemaphoreSlim(maxConcurrency, maxConcurrency)
             : null;
+
+        async ValueTask<TNext> ExecuteStepAsync(
+            TCurrent currentValue,
+            PipelineExecutionContext stepContext,
+            CancellationToken cancellationToken)
+        {
+            var traceContext = PipelineTraceContext.Current;
+            if (traceContext is null)
+                return await ExecuteWithConcurrencyAsync(currentValue, stepContext, cancellationToken).ConfigureAwait(false);
+
+            return await traceContext.TraceStepAsync(
+                stepNode.Name,
+                stepNode.Kind,
+                typeof(TCurrent),
+                typeof(TNext),
+                () => ExecuteWithConcurrencyAsync(currentValue, stepContext, cancellationToken)).ConfigureAwait(false);
+        }
+
+        var nextPlan = plan.Then(stepNode.Id, stepNode.Name, stepNode.Kind, ExecuteStepAsync);
 
         return new PipelineBuilder<TInput, TNext>(
             async (input, cancellationToken) =>
             {
                 var currentValue = await chain(input, cancellationToken).ConfigureAwait(false);
-                var traceContext = PipelineTraceContext.Current;
-                if (traceContext is null)
-                    return await ExecuteWithConcurrencyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+                if (PipelineExecutionContext.Current is { } context)
+                    return await ExecuteStepAsync(currentValue, context, cancellationToken).ConfigureAwait(false);
 
-                return await traceContext.TraceStepAsync(
-                    effectiveStepName ?? nodeKind.ToString(),
-                    nodeKind,
-                    typeof(TCurrent),
-                    typeof(TNext),
-                    () => ExecuteWithConcurrencyAsync(currentValue, cancellationToken)).ConfigureAwait(false);
+                var fallbackContext = new PipelineExecutionContext(
+                    Guid.NewGuid().ToString("D"),
+                    "fallback-pipeline",
+                    "Fallback Pipeline",
+                    "1.0.0",
+                    null);
+                return await ExecuteStepAsync(currentValue, fallbackContext, cancellationToken).ConfigureAwait(false);
             },
             logger,
-            graph.AddStep(effectiveStepName, typeof(TCurrent), typeof(TNext), nodeKind),
-            null,
-            checkpointOptions);
+            nextGraph,
+            nextPlan,
+            checkpointOptions,
+            observers);
 
-        async ValueTask<TNext> ExecuteUserStepAsync(TCurrent currentValue, CancellationToken cancellationToken) =>
-            await step(currentValue, cancellationToken).ConfigureAwait(false);
+        async ValueTask<TNext> ExecuteUserStepAsync(
+            TCurrent currentValue,
+            PipelineExecutionContext stepContext,
+            CancellationToken cancellationToken) =>
+            await step(currentValue, stepContext, cancellationToken).ConfigureAwait(false);
 
-        async ValueTask<TNext> ExecuteWithPolicyAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        async ValueTask<TNext> ExecuteWithPolicyAsync(
+            TCurrent currentValue,
+            PipelineExecutionContext stepContext,
+            CancellationToken cancellationToken)
         {
             if (effectiveOptions.Policy is { } policy)
-                return await policy.ExecuteAsync(token => ExecuteUserStepAsync(currentValue, token), cancellationToken)
+                return await policy.ExecuteAsync(
+                        token => ExecuteUserStepAsync(currentValue, stepContext, token),
+                        cancellationToken)
                     .ConfigureAwait(false);
 
-            return await ExecuteUserStepAsync(currentValue, cancellationToken).ConfigureAwait(false);
+            return await ExecuteUserStepAsync(currentValue, stepContext, cancellationToken).ConfigureAwait(false);
         }
 
-        async ValueTask<TNext> ExecuteWithRateLimitAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        async ValueTask<TNext> ExecuteWithRateLimitAsync(
+            TCurrent currentValue,
+            PipelineExecutionContext stepContext,
+            CancellationToken cancellationToken)
         {
             if (effectiveOptions.RateLimiter is not { } rateLimiter)
-                return await ExecuteWithPolicyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+                return await ExecuteWithPolicyAsync(currentValue, stepContext, cancellationToken).ConfigureAwait(false);
 
             using var lease = await rateLimiter.AcquireAsync(1, cancellationToken).ConfigureAwait(false);
             if (!lease.IsAcquired)
-                throw new PipelineRateLimitRejectedException(effectiveStepName ?? "Unnamed step");
+                throw new PipelineRateLimitRejectedException(stepNode.Name);
 
-            return await ExecuteWithPolicyAsync(currentValue, cancellationToken).ConfigureAwait(false);
+            return await ExecuteWithPolicyAsync(currentValue, stepContext, cancellationToken).ConfigureAwait(false);
         }
 
-        async ValueTask<TNext> ExecuteWithConcurrencyAsync(TCurrent currentValue, CancellationToken cancellationToken)
+        async ValueTask<TNext> ExecuteWithConcurrencyAsync(
+            TCurrent currentValue,
+            PipelineExecutionContext stepContext,
+            CancellationToken cancellationToken)
         {
             if (concurrencyGate is null)
-                return await ExecuteWithRateLimitAsync(currentValue, cancellationToken).ConfigureAwait(false);
+                return await ExecuteWithRateLimitAsync(currentValue, stepContext, cancellationToken).ConfigureAwait(false);
 
             await concurrencyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                return await ExecuteWithRateLimitAsync(currentValue, cancellationToken).ConfigureAwait(false);
+                return await ExecuteWithRateLimitAsync(currentValue, stepContext, cancellationToken).ConfigureAwait(false);
             }
             finally
             {

@@ -18,11 +18,13 @@ public sealed class PipelineDefinition
     /// <param name="name">The pipeline display name.</param>
     /// <param name="nodes">The pipeline graph nodes.</param>
     /// <param name="edges">The directed graph edges.</param>
+    /// <param name="version">The pipeline definition version.</param>
     public PipelineDefinition(
         string id,
         string name,
         IEnumerable<PipelineNode> nodes,
-        IEnumerable<PipelineEdge> edges)
+        IEnumerable<PipelineEdge> edges,
+        string? version = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(id);
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
@@ -31,6 +33,7 @@ public sealed class PipelineDefinition
 
         Id = id;
         Name = name;
+        Version = string.IsNullOrWhiteSpace(version) ? "1.0.0" : version;
         Nodes = nodes.ToArray();
         Edges = edges.ToArray();
     }
@@ -44,6 +47,11 @@ public sealed class PipelineDefinition
     /// Gets the pipeline display name.
     /// </summary>
     public string Name { get; }
+
+    /// <summary>
+    /// Gets the pipeline definition version.
+    /// </summary>
+    public string Version { get; }
 
     /// <summary>
     /// Gets the pipeline graph nodes.
@@ -158,6 +166,7 @@ public sealed class PipelineDefinition
         {
             id = Id,
             name = Name,
+            version = Version,
             nodes = Nodes.Select(node => new
             {
                 id = node.Id,
@@ -178,6 +187,41 @@ public sealed class PipelineDefinition
             model,
             options ?? new JsonSerializerOptions { WriteIndented = true });
     }
+
+    /// <summary>
+    /// Validates whether a checkpoint is compatible with this pipeline definition.
+    /// </summary>
+    /// <param name="checkpoint">The checkpoint to validate.</param>
+    /// <returns>A compatibility report.</returns>
+    public PipelineCheckpointCompatibilityReport ValidateCheckpointCompatibility(PipelineCheckpoint checkpoint)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+
+        var issues = new List<string>();
+
+        if (checkpoint.PipelineId != Id)
+            issues.Add($"Checkpoint pipeline id `{checkpoint.PipelineId}` does not match definition id `{Id}`.");
+
+        if (!string.Equals(checkpoint.PipelineVersion, Version, StringComparison.Ordinal))
+            issues.Add($"Checkpoint version `{checkpoint.PipelineVersion}` does not match definition version `{Version}`.");
+
+        var node = Nodes.FirstOrDefault(candidate => candidate.Id == checkpoint.NodeId);
+        if (node is null)
+        {
+            issues.Add($"Checkpoint node `{checkpoint.NodeId}` does not exist in this definition.");
+        }
+        else if (!IsTypeCompatible(node.OutputType, checkpoint.PayloadType))
+        {
+            issues.Add($"Checkpoint payload type `{checkpoint.PayloadType}` is not compatible with node `{node.Id}` output type `{node.OutputType.FullName}`.");
+        }
+
+        return new PipelineCheckpointCompatibilityReport(issues);
+    }
+
+    private static bool IsTypeCompatible(Type expectedType, string payloadType) =>
+        payloadType == expectedType.AssemblyQualifiedName ||
+        payloadType == expectedType.FullName ||
+        payloadType == expectedType.Name;
 
     private static string EscapeDot(string value) =>
         value

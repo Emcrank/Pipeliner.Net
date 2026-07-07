@@ -71,6 +71,11 @@ public enum PipelineNodeKind
     Checkpoint,
 
     /// <summary>
+    /// A controlled halt point.
+    /// </summary>
+    Halt,
+
+    /// <summary>
     /// An execution policy wrapper.
     /// </summary>
     Policy

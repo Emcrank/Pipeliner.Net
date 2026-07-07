@@ -16,7 +16,9 @@ Pipeliner.Net is useful when you need to:
 - run synchronous and asynchronous operations in the same pipeline,
 - add resilience policies (like retries) around execution,
 - process data in batches,
-- branch, fork, and merge workflow paths.
+- branch, fork, and merge workflow paths,
+- halt workflows at explicit gates for manual review,
+- observe run and step events for diagnostics and profiling.
 
 Typical use cases:
 
@@ -194,7 +196,51 @@ var pipeline = Pipeline
 
 State is created once per pipeline run, so concurrent executions do not share mutable state.
 
-### 7) Pipeline-level execution policy
+### 7) Context-aware steps
+
+Use the `PipelineExecutionContext` overload when a step needs run metadata, pipeline metadata, step metadata, or checkpoint helpers.
+
+```csharp
+var pipeline = Pipeline
+    .For<Order>()
+    .ThenAsync("Enrich", async (order, context, cancellationToken) =>
+    {
+        Console.WriteLine($"Run {context.RunId} executing {context.StepName}");
+        return await EnrichOrderAsync(order, context.PipelineVersion, cancellationToken);
+    })
+    .Build("Order enrichment", "2.4.0");
+```
+
+The context exposes the run ID, pipeline ID, pipeline name, pipeline version, current step ID, current step name, current step kind, current attempt number, and recorded attempts for the run.
+
+### 8) Halt gates
+
+Use `HaltWhen(...)` when a workflow should stop at a controlled point instead of continuing downstream. This is useful for manual review, compliance holds, approval workflows, or external repair before retrying later.
+
+```csharp
+var pipeline = Pipeline
+    .For<Order>()
+    .Then("Validate", ValidateOrder)
+    .HaltWhen("Manual review", order => order.RiskScore > 80)
+    .ThenAsync("Submit", SubmitOrderAsync)
+    .Build("Order submission", "2.4.0");
+PipelineRunOutcome<OrderSubmission> outcome =
+    await pipeline.RunWithStatusAsync(order, cancellationToken);
+
+if (outcome.IsHalted)
+{
+    Console.WriteLine($"Halted at {outcome.Halt!.HaltName} for run {outcome.Halt.RunId}");
+    return;
+}
+
+OrderSubmission submission = outcome.Value!;
+```
+
+Use `RunWithStatusAsync(...)` when halt is an expected workflow outcome. It returns `PipelineRunStatus.Completed`, `PipelineRunStatus.Halted`, `PipelineRunStatus.Failed`, or `PipelineRunStatus.Cancelled` without requiring callers to catch an exception for controlled halts.
+
+`RunAsync(...)` still throws `PipelineHaltedException` for callers that prefer the existing success/failure execution model. Observer hooks receive run and step halt events in both modes.
+
+### 9) Pipeline-level execution policy
 
 ```csharp
 var pipeline = Pipeline
@@ -204,7 +250,7 @@ var pipeline = Pipeline
     .Build();
 ```
 
-### 8) Dynamic routing
+### 10) Dynamic routing
 
 ```csharp
 var pipeline = Pipeline
@@ -221,7 +267,7 @@ var pipeline = Pipeline
 
 If no route matches and no default route is configured, `PipelineRouteNotFoundException` is thrown.
 
-### 9) Branch and branch async
+### 11) Branch and branch async
 
 ```csharp
 var pipeline = Pipeline
@@ -240,7 +286,50 @@ var label = await pipeline.RunAsync(150);
 // large:150
 ```
 
-### 10) Fork + merge (custom reducer)
+### 12) How fork works
+
+`Fork(...)` fans out the current pipeline value to multiple branch delegates and executes those branches concurrently. Every branch receives the same input value and returns the same branch output type.
+
+```csharp
+var forkOnly = Pipeline
+    .For<Order>()
+    .Fork<OrderCheckResult>(
+        (order, cancellationToken) => CheckInventoryAsync(order, cancellationToken),
+        (order, cancellationToken) => CheckPaymentRiskAsync(order, cancellationToken),
+        (order, cancellationToken) => CheckShippingAsync(order, cancellationToken))
+    .Build("Order checks");
+
+ForkExecutionResult<OrderCheckResult> result = await forkOnly.RunAsync(order);
+```
+
+The output of a fork step is `ForkExecutionResult<TBranch>`. It contains one `ForkResult<TBranch>` per branch, in the same order the branches were registered.
+
+Each `ForkResult<TBranch>` contains:
+
+- `Index`: the branch index from the original registration order,
+- `IsSuccess`: whether that branch completed successfully,
+- `Value`: the branch output when successful,
+- `Error`: the branch exception when failed.
+
+Fork execution has a deliberate failure model: one failed branch does not automatically fail the fork step. The fork captures every branch outcome first. The next `Merge(...)` step decides whether branch failures should fail the pipeline, be ignored, or allow the first successful branch to win.
+
+This is useful when independent checks or data fetches can run at the same time:
+
+- call several external services using the same request,
+- enrich a record from multiple independent sources,
+- run independent validations and aggregate the results,
+- calculate competing projections and choose one,
+- fan out to optional providers where partial success is acceptable.
+
+`Fork(...)` is different from `ThenParallel(...)`:
+
+- `Fork(...)` runs several different branch delegates against one current value.
+- `ThenParallel(...)` runs one delegate across many items in the current value.
+
+### 13) Fork + merge (custom reducer)
+
+Use `Merge(...)` immediately after `Fork(...)` when the pipeline should continue with a single value. With the default `CustomReducer` behavior, failed branches are ignored and the merge delegate receives only successful branch values. If every branch failed, the merge step throws an `AggregateException` containing the branch failures.
+
 
 ```csharp
 var pipeline = Pipeline
@@ -257,7 +346,9 @@ Console.WriteLine(finalPrice);
 // 371.6
 ```
 
-### 11) Built-in merge strategy: throw on any failure
+### 14) Built-in merge strategy: throw on any failure
+
+Use `MergeStepOptions.ThrowOnAnyFailure()` when every branch is required. If any branch failed, the merge step throws an `AggregateException`; otherwise it returns all successful values in branch order.
 
 ```csharp
 var pipeline = Pipeline
@@ -274,7 +365,9 @@ var pipeline = Pipeline
 await Assert.ThrowsAsync<AggregateException>(() => pipeline.RunAsync(10));
 ```
 
-### 12) Built-in merge strategy: ignore failures
+### 15) Built-in merge strategy: ignore failures
+
+Use `MergeStepOptions.IgnoreFailures()` when branches are optional. Failed branches are dropped, and the output is the successful values in branch order.
 
 ```csharp
 var pipeline = Pipeline
@@ -292,7 +385,9 @@ var results = await pipeline.RunAsync(10);
 // [11, 13]
 ```
 
-### 13) Built-in merge strategy: take first
+### 16) Built-in merge strategy: take first
+
+Use `MergeStepOptions.TakeFirst()` when branches represent fallback providers or competing strategies. The first successful branch in registration order becomes the merge output. If no branch succeeds, the merge step throws.
 
 ```csharp
 var pipeline = Pipeline
@@ -309,7 +404,7 @@ var first = await pipeline.RunAsync(10);
 // 11
 ```
 
-### 14) Parallel projection
+### 17) Parallel projection
 
 ```csharp
 var pipeline = Pipeline
@@ -413,7 +508,7 @@ var pipeline = Pipeline
     .Checkpoint("After validation")
     .ThenAsync("Submit to ERP", SubmitToErpAsync)
     .WithCheckpointing(store)
-    .Build("Order submission");
+    .Build("Order submission", "2.4.0");
 
 await pipeline.RunAsync(order, cancellationToken);
 ```
@@ -421,12 +516,13 @@ await pipeline.RunAsync(order, cancellationToken);
 Each saved checkpoint includes:
 
 - run ID,
-- pipeline ID and name,
+- pipeline ID, name, and version,
 - checkpoint name,
 - checkpoint node ID,
 - payload type,
 - JSON payload,
-- creation timestamp.
+- creation timestamp,
+- pipeline version.
 
 You can load checkpoints for a specific run or all checkpoints for a pipeline:
 
@@ -522,70 +618,234 @@ var pipeline = Pipeline
     .Build("Import workflow");
 ```
 
+### Checkpoint compatibility
+
+Pipeline definitions are versioned. Pass a version when building a pipeline if checkpoints may outlive a deployment or need compatibility checks before recovery.
+
+```csharp
+var pipeline = Pipeline
+    .For<Order>()
+    .Then("Validate", ValidateOrder)
+    .Checkpoint("After validation")
+    .ThenAsync("Submit", SubmitOrderAsync)
+    .WithCheckpointing(store)
+    .Build("Order submission", "2.4.0");
+
+var checkpoints = await store.LoadByPipelineAsync(pipeline.Id, cancellationToken);
+var latest = checkpoints.Last();
+
+PipelineCheckpointCompatibilityReport report =
+    pipeline.Describe().ValidateCheckpointCompatibility(latest);
+
+if (!report.IsCompatible)
+{
+    foreach (var issue in report.Issues)
+    {
+        Console.WriteLine(issue);
+    }
+}
+```
+
+Compatibility validation checks the pipeline ID, pipeline version, checkpoint node ID, and checkpoint payload type against the current pipeline definition.
+
 ## Stream execution with backpressure
+
+Stream pipelines are for `IAsyncEnumerable<T>` sources where items arrive over time instead of as one request payload. They are useful when you want to keep processing code strongly typed while consuming a live or long-running source.
+
+Typical use cases:
+
+- process events from a queue, broker, websocket, or change feed,
+- normalize telemetry or metrics as they arrive,
+- import large files without loading everything into memory,
+- enrich incoming records one item at a time,
+- group small events into database-friendly batches,
+- compute rolling time-window summaries,
+- apply bounded backpressure when consumers are slower than producers.
+
+Stream pipelines are intentionally separate from durable checkpoint execution v1. Use them for live transformation and bounded buffering; use request-response pipelines with checkpoints when you need persisted recovery points.
 
 ### Stream builder quick start
 
 ```csharp
+static async IAsyncEnumerable<string> ReadLinesAsync(
+    [EnumeratorCancellation] CancellationToken cancellationToken = default)
+{
+    while (!cancellationToken.IsCancellationRequested)
+    {
+        var line = await ReadNextLineAsync(cancellationToken);
+        if (line is null)
+            yield break;
+
+        yield return line;
+    }
+}
+
 var streamPipeline = Pipeline
     .StreamFor<string>()
-    .Then<int>(int.Parse)
-    .ThenAsync<int>(async (value, cancellationToken) =>
+    .Then("Trim", line => line.Trim())
+    .Then("Parse", int.Parse)
+    .ThenAsync("Enrich", async (value, cancellationToken) =>
     {
-        await Task.Delay(10, cancellationToken);
-        return value + 1;
+        var multiplier = await GetCurrentMultiplierAsync(cancellationToken);
+        return value * multiplier;
     })
-    .Build("Stream parse and increment");
+    .Build("Live line processor");
 
-await foreach (var item in streamPipeline.RunStreamAsync(GetInputsAsync()))
+await foreach (var item in streamPipeline.RunStreamAsync(ReadLinesAsync(), cancellationToken))
 {
     Console.WriteLine(item);
 }
 ```
 
+Each item flows through the configured steps independently. The pipeline starts yielding transformed output as soon as output is available; it does not wait for the source sequence to finish.
+
+### Event ingestion example
+
+This shape works well for queue or broker consumers where each event should be validated, normalized, and sent downstream.
+
+```csharp
+var ingestionPipeline = Pipeline
+    .StreamFor<OrderCreated>()
+    .WithBackpressure(BackpressureOptions.Create(512, BackpressureMode.Wait))
+    .Then("Validate", ValidateOrderCreated)
+    .Then("Normalize", NormalizeOrderCreated)
+    .ThenAsync("Publish read model", PublishReadModelAsync)
+    .Build("Order event ingestion");
+
+await foreach (var published in ingestionPipeline.RunStreamAsync(orderEvents, cancellationToken))
+{
+    logger.LogInformation("Published read model {OrderId}", published.OrderId);
+}
+```
+
+Use this when every item matters and the producer should slow down if the consumer cannot keep up.
+
 ### Configure bounded channel backpressure
+
+Backpressure controls what happens when the internal channel reaches capacity.
 
 ```csharp
 var streamPipeline = Pipeline
-    .StreamFor<int>()
-    .WithBackpressure(BackpressureOptions.Create(256, BackpressureMode.Wait))
-    .Then<int>(value => value * 2)
-    .Build();
+    .StreamFor<SensorReading>()
+    .WithBackpressure(BackpressureOptions.Create(
+        capacity: 1_000,
+        mode: BackpressureMode.Wait))
+    .Then("Normalize", NormalizeReading)
+    .Build("Sensor normalization");
 ```
 
-### Batch and window stream items
+Available modes:
+
+- `BackpressureMode.Wait`: wait for capacity; best when every item must be processed.
+- `BackpressureMode.DropNewest`: reject the newest write when full; useful for lossy real-time feeds.
+- `BackpressureMode.DropOldest`: discard the oldest buffered item; useful when the newest value is most important.
+- `BackpressureMode.DropWrite`: drop the current write; useful when producers should never block.
+
+Choose the mode based on data value:
+
+- orders, payments, audit events: usually `Wait`,
+- UI cursor positions, live gauges, frequent sensor updates: often `DropOldest` or `DropWrite`,
+- noisy telemetry where recent data matters more than completeness: often `DropNewest` or `DropOldest`.
+
+### Batch stream items for efficient writes
+
+`Batch(size, maxDelay)` groups items by count and can also flush a partial batch after a maximum delay. This is useful for database inserts, API bulk calls, search indexing, or file writes.
 
 ```csharp
 var batchedPipeline = Pipeline
     .StreamFor<OrderCreated>()
+    .Then("Normalize", NormalizeOrderCreated)
     .Batch(size: 100, maxDelay: TimeSpan.FromSeconds(5))
-    .ThenAsync<ImportResult>(ImportBatchAsync)
+    .ThenAsync("Bulk import", async (orders, cancellationToken) =>
+    {
+        await orderRepository.InsertManyAsync(orders, cancellationToken);
+        return new ImportResult(orders.Count);
+    })
     .Build("Order import batches");
 
 await foreach (var result in batchedPipeline.RunStreamAsync(events, cancellationToken))
 {
-    Console.WriteLine(result.ImportedCount);
+    Console.WriteLine($"Imported {result.ImportedCount} orders");
 }
 ```
 
+Batching behavior:
+
+- if `size` is reached first, the batch flushes immediately,
+- if `maxDelay` is reached first, the current partial batch flushes,
+- when the source completes, any remaining items flush as the final batch.
+
+### Window stream items for time-based summaries
+
+`Window(duration)` emits the items collected during each time window. This is useful for metrics, telemetry, monitoring, rolling summaries, and compacting high-volume feeds.
+
 ```csharp
-var windowedPipeline = Pipeline
+var metricPipeline = Pipeline
     .StreamFor<MetricPoint>()
     .Window(TimeSpan.FromSeconds(10))
-    .Then(window => window.Average(point => point.Value))
-    .Build("Metric windows");
+    .Then(window => new MetricSummary(
+        Count: window.Count,
+        Average: window.Count == 0 ? 0 : window.Average(point => point.Value),
+        Max: window.Count == 0 ? 0 : window.Max(point => point.Value)))
+    .Build("Metric summaries");
+
+await foreach (var summary in metricPipeline.RunStreamAsync(metricPoints, cancellationToken))
+{
+    await dashboard.PublishAsync(summary, cancellationToken);
+}
 ```
 
-Available backpressure modes:
+Windowing is time-first. It is a good fit when the question is “what happened during this period?” rather than “do I have exactly N items?”
 
-- `BackpressureMode.Wait`
-- `BackpressureMode.DropNewest`
-- `BackpressureMode.DropOldest`
-- `BackpressureMode.DropWrite`
+### Large file import example
 
+Streaming lets you process large files without materializing all rows first.
+
+```csharp
+static async IAsyncEnumerable<CustomerRow> ReadCustomerRowsAsync(
+    string path,
+    [EnumeratorCancellation] CancellationToken cancellationToken = default)
+{
+    await foreach (var row in Csv.ReadAsync<CustomerRow>(path, cancellationToken))
+        yield return row;
+}
+
+var importPipeline = Pipeline
+    .StreamFor<CustomerRow>()
+    .Then("Validate", ValidateCustomerRow)
+    .Then("Map", MapCustomer)
+    .Batch(size: 500, maxDelay: TimeSpan.FromSeconds(2))
+    .ThenAsync("Upsert", async (customers, cancellationToken) =>
+    {
+        await customerRepository.UpsertManyAsync(customers, cancellationToken);
+        return customers.Count;
+    })
+    .Build("Customer CSV import");
+
+var imported = 0;
+await foreach (var count in importPipeline.RunStreamAsync(ReadCustomerRowsAsync(path), cancellationToken))
+    imported += count;
+```
+
+This keeps memory bounded and makes the batch size explicit.
+
+### Cancellation
+
+Stream execution observes cancellation while reading, transforming, batching, and yielding items.
+
+```csharp
+using var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+
+await foreach (var item in streamPipeline.RunStreamAsync(source, cancellationTokenSource.Token))
+{
+    await ProcessAsync(item, cancellationTokenSource.Token);
+}
+```
+
+Cancel the token to stop consuming the source and stop pending asynchronous steps.
 ## MergeReducers helper
 
-Use `MergeReducers` directly when you need custom aggregation over detailed branch outcomes (`ForkResult<T>`):
+Use `MergeReducers` directly when you need custom aggregation over detailed branch outcomes (`ForkResult<T>`). Reducers operate on the branch result list produced by `Fork(...)`, so they can preserve branch order and skip failed branches consistently:
 
 ```csharp
 var forkPipeline = Pipeline
@@ -628,7 +888,7 @@ Built pipelines expose structural metadata through `Describe()`. Named overloads
 
 `PipelineDefinition` contains:
 
-- pipeline ID and name,
+- pipeline ID, name, and version,
 - graph nodes,
 - graph edges,
 - node kinds,
@@ -646,7 +906,7 @@ var pipeline = Pipeline
         order => order.RiskScore > 80,
         high => high with { ReviewRequired = true },
         low => low)
-    .Build("Order workflow");
+    .Build("Order workflow", "2.4.0");
 
 var definition = pipeline.Describe();
 ```
@@ -667,6 +927,7 @@ Example output:
 {
   "id": "4f4e7b8f-2c2e-4f2f-9f5d-4b90f9f2c99f",
   "name": "Order workflow",
+  "version": "2.4.0",
   "nodes": [
     {
       "id": "input",
@@ -750,6 +1011,46 @@ A DOT file can be rendered with Graphviz:
 ```bash
 dot -Tpng order-workflow.dot -o order-workflow.png
 ```
+
+## Observers and step attempts
+
+Use `IPipelineObserver` when you need live run and step events without adding logging or metrics code inside every step. Observers can collect profiling data, audit records, operational logs, or custom telemetry.
+
+```csharp
+public sealed class LoggingPipelineObserver : IPipelineObserver
+{
+    public ValueTask OnStepCompletedAsync(
+        PipelineStepCompleted completed,
+        CancellationToken cancellationToken = default)
+    {
+        var attempt = completed.Attempt;
+        Console.WriteLine(
+            $"{attempt.StepName} completed in {attempt.Duration.TotalMilliseconds}ms");
+
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask OnStepFailedAsync(
+        PipelineStepFailed failed,
+        CancellationToken cancellationToken = default)
+    {
+        var attempt = failed.Attempt;
+        Console.WriteLine(
+            $"{attempt.StepName} failed on attempt {attempt.AttemptNumber}: {attempt.ExceptionMessage}");
+
+        return ValueTask.CompletedTask;
+    }
+}
+
+var pipeline = Pipeline
+    .For<Order>()
+    .WithObserver(new LoggingPipelineObserver())
+    .Then("Validate", ValidateOrder)
+    .ThenAsync("Submit", SubmitOrderAsync)
+    .Build("Observed order workflow", "2.4.0");
+```
+
+`PipelineStepAttempt` records include run ID, pipeline ID, pipeline name, pipeline version, step ID, step name, step kind, attempt number, status, start/end timestamps, duration, exception type, and exception message.
 
 ## Step tracing
 
