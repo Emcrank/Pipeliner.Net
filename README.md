@@ -5,7 +5,7 @@
 [![Continous Integration](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/ci.yml/badge.svg)](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/ci.yml)
 [![Release](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/release.yml/badge.svg)](https://github.com/Emcrank/Pipeliner.Net/actions/workflows/release.yml)
 
-A high-performance, typed pipeline library for building reusable request workflows with a fluent API.
+A strongly typed, high-performance .NET pipeline framework for orchestrating complex workflows with branching, resilience, and streaming support.
 
 ## Why use Pipeliner.Net?
 
