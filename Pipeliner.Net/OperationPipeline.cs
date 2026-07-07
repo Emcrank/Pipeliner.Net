@@ -66,11 +66,6 @@ public sealed class OperationPipeline<TParam, TResult>
     private ILogger? Logger { get; }
 
     /// <summary>
-    /// Gets the current execution parameter for the active run.
-    /// </summary>
-    private TParam Parameter => currentRunContext.Value is { } runContext ? runContext.Parameter : default!;
-
-    /// <summary>
     /// Executes the pipeline synchronously.
     /// </summary>
     /// <param name="parameter">The pipeline input parameter.</param>
@@ -439,8 +434,8 @@ public sealed class OperationPipeline<TParam, TResult>
 
     private TResult? RunInternal(RunContext runContext, CancellationToken cancellationToken = default)
     {
-        var firstOperation = operations.First();
-        var lastOperation = operations.Last();
+        var firstOperation = operations[0];
+        var lastOperation = operations[^1];
 
         object? operationResult = default(TResult?);
 
