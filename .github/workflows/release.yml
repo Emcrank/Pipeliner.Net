@@ -32,7 +32,7 @@ jobs:
     - name: Test
       run: dotnet test --configuration Release /p:Version=${VERSION} --no-build
     - name: Pack
-      run: dotnet pack --configuration Release /p:Version=${VERSION} --no-build --output .
+      run: dotnet pack ./Pipeliner.Net/Pipeliner.Net.csproj --configuration Release /p:Version=${VERSION} --no-build --output .
     - name: Push GitHub
       run: dotnet nuget push Pipeliner.Net.${VERSION}.nupkg --source https://nuget.pkg.github.com/emcrank/index.json --api-key "${GIT_APIKEY}"
       env:
